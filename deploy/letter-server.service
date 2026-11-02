@@ -1,0 +1,26 @@
+# /etc/systemd/system/letter-server.service
+# 사용 전: sudo useradd --system --no-create-home letter
+#          sudo mkdir -p /opt/letter
+#          sudo javac -encoding UTF-8 -d /opt/letter $(find src -name '*.java')
+[Unit]
+Description=Letter Server
+After=network.target
+
+[Service]
+User=letter
+WorkingDirectory=/opt/letter
+Environment=PORT=10000
+Environment=DATA_DIR=/var/lib/letter
+Environment=RATE_LIMIT_PER_MIN=600
+ExecStart=/usr/bin/java -cp /opt/letter letter.server.LetterServer
+Restart=on-failure
+RestartSec=3
+# /var/lib/letter 를 만들어 주고 letter 사용자가 쓸 수 있게 한다
+StateDirectory=letter
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

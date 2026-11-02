@@ -1,0 +1,16 @@
+# --- 빌드 ---
+FROM eclipse-temurin:17-jdk AS build
+WORKDIR /src
+COPY LetterServer.java .
+RUN javac -encoding UTF-8 -d /out LetterServer.java
+
+# --- 실행 ---
+FROM eclipse-temurin:17-jre
+RUN useradd --system --uid 10001 letter \
+ && mkdir /data && chown letter /data
+COPY --from=build /out /app
+USER letter
+ENV PORT=8080 DATA_DIR=/data
+VOLUME /data
+EXPOSE 8080
+ENTRYPOINT ["java", "-cp", "/app", "LetterServer"]
