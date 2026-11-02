@@ -5,7 +5,7 @@ package letter.client;
  * 서버 주소는 실행 인자 > 환경변수 LETTER_SERVER_URL > 기본값 순으로 사용한다.
  */
 public class LetterClient {
-    private static final String DEFAULT_URL = "http://localhost:8080";
+    private static final String DEFAULT_URL = "http://service.gsmsv.site:26129";
 
     public static void main(String[] args) {
         String url = args.length > 0 ? args[0] : System.getenv("LETTER_SERVER_URL");

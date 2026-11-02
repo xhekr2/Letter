@@ -30,10 +30,10 @@ public class LetterApp {
                         case "1" -> write();
                         case "2" -> read();
                         case "3" -> {
-                            view.println("안녕히 가세요!");
+                            view.println("프로그램을 종료합니다.");
                             return;
                         }
-                        default -> view.println("1~3 중에서 선택해 주세요.");
+                        default -> view.println("잘못된 입력입니다.");
                     }
                 } catch (ConsoleView.InputClosedException e) {
                     throw e;
