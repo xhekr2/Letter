@@ -9,8 +9,22 @@ import java.util.Map;
 /**
  * 서버 설정(불변). 환경변수 PORT, DATA_DIR, MAX_BODY_BYTES, RATE_LIMIT_PER_MIN, TIME_ZONE 로 바꿀 수 있고,
  * 첫 번째 실행 인자로 포트를 덮어쓸 수 있다.
+ * DISCORD_BOT_TOKEN 이 있으면 디스코드 전송 기능이 켜진다. (없으면 꺼짐)
  */
-public record ServerConfig(int port, Path dataDir, int maxBodyBytes, int rateLimitPerMinute, ZoneId zone) {
+public record ServerConfig(int port, Path dataDir, int maxBodyBytes, int rateLimitPerMinute, ZoneId zone,
+                           String discordBotToken) {
+
+    public boolean discordEnabled() {
+        return discordBotToken != null;
+    }
+
+    /** 봇 토큰이 로그에 찍히지 않도록 toString 에서 뺀다. */
+    @Override
+    public String toString() {
+        return "ServerConfig[port=" + port + ", dataDir=" + dataDir + ", maxBodyBytes=" + maxBodyBytes
+                + ", rateLimitPerMinute=" + rateLimitPerMinute + ", zone=" + zone
+                + ", discord=" + (discordEnabled() ? "on" : "off") + "]";
+    }
 
     /** @throws IllegalArgumentException 설정 값이 올바르지 않을 때 */
     public static ServerConfig from(Map<String, String> env, String[] args) {
@@ -27,7 +41,9 @@ public record ServerConfig(int port, Path dataDir, int maxBodyBytes, int rateLim
         } catch (DateTimeException e) {
             throw new IllegalArgumentException("TIME_ZONE 값이 올바르지 않습니다: " + env.get("TIME_ZONE"));
         }
-        return new ServerConfig(port, dataDir, maxBodyBytes, rateLimit, zone);
+        String token = env.get("DISCORD_BOT_TOKEN");
+        String discordToken = (token == null || token.isBlank()) ? null : token.trim();
+        return new ServerConfig(port, dataDir, maxBodyBytes, rateLimit, zone, discordToken);
     }
 
     private static String stringOf(Map<String, String> env, String name, String def) {

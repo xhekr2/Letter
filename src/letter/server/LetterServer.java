@@ -1,10 +1,15 @@
 package letter.server;
 
 import com.sun.net.httpserver.HttpServer;
+import letter.server.discord.DiscordGateway;
+import letter.server.discord.DiscordRestGateway;
+import letter.server.discord.DisabledDiscordGateway;
+import letter.server.http.DiscordUserHttpHandler;
 import letter.server.http.HttpResponses;
 import letter.server.http.LetterHttpHandler;
 import letter.server.http.RateLimitedHandler;
 import letter.server.http.RateLimiter;
+import letter.server.service.LetterDeliveryService;
 import letter.server.service.LetterService;
 import letter.server.service.RandomCodeGenerator;
 import letter.server.storage.FileLetterRepository;
@@ -15,6 +20,7 @@ import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.security.SecureRandom;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -26,7 +32,12 @@ import java.util.logging.Logger;
  * 나머지 클래스들은 인터페이스에만 의존한다.
  */
 public class LetterServer {
+    /** 같은 사람에게 디스코드 DM이 몰리지 않도록: 받는 사람 한 명당 10분에 3번까지 */
+    private static final int DM_LIMIT_PER_TARGET = 3;
+    private static final Duration DM_LIMIT_WINDOW = Duration.ofMinutes(10);
+
     private final ServerConfig config;
+    private final DiscordGateway discordOverride;
     private final Logger log = Logger.getLogger(LetterServer.class.getName());
 
     private HttpServer server;
@@ -34,7 +45,18 @@ public class LetterServer {
     private ScheduledExecutorService cleaner;
 
     public LetterServer(ServerConfig config) {
+        this(config, null);
+    }
+
+    /** 디스코드 게이트웨이를 직접 지정한다. (테스트에서 가짜 디스코드를 끼워 넣을 때 쓴다. null이면 설정에 따라 고른다.) */
+    public LetterServer(ServerConfig config, DiscordGateway discordOverride) {
         this.config = config;
+        this.discordOverride = discordOverride;
+    }
+
+    /** 실제로 열린 포트. (설정에서 포트를 0으로 주면 비어 있는 포트가 자동으로 정해진다.) */
+    public int port() {
+        return server.getAddress().getPort();
     }
 
     public void start() throws IOException {
@@ -44,11 +66,18 @@ public class LetterServer {
                 repository, new RandomCodeGenerator(new SecureRandom()), Clock.system(config.zone()));
         RateLimiter limiter = new RateLimiter(config.rateLimitPerMinute(), Clock.systemUTC());
 
+        DiscordGateway discord = discordOverride != null ? discordOverride
+                : config.discordEnabled() ? new DiscordRestGateway(config.discordBotToken())
+                : new DisabledDiscordGateway();
+        RateLimiter targetLimiter = new RateLimiter(DM_LIMIT_PER_TARGET, DM_LIMIT_WINDOW, Clock.systemUTC());
+        LetterDeliveryService delivery = new LetterDeliveryService(service, discord, targetLimiter);
+
         server = HttpServer.create(new InetSocketAddress(config.port()), 0);
         executor = Executors.newFixedThreadPool(8);
         server.setExecutor(executor);
         server.createContext("/letters",
-                new RateLimitedHandler(new LetterHttpHandler(service, config.maxBodyBytes()), limiter));
+                new RateLimitedHandler(new LetterHttpHandler(service, delivery, config.maxBodyBytes()), limiter));
+        server.createContext("/discord", new RateLimitedHandler(new DiscordUserHttpHandler(delivery), limiter));
         server.createContext("/health", ex -> HttpResponses.send(ex, 200, "ok"));
         server.createContext("/", ex -> HttpResponses.sendError(ex, 404, "지원하지 않는 주소입니다."));
 
@@ -58,9 +87,11 @@ public class LetterServer {
             return t;
         });
         cleaner.scheduleAtFixedRate(limiter::evictExpired, 1, 1, TimeUnit.MINUTES);
+        cleaner.scheduleAtFixedRate(targetLimiter::evictExpired, 1, 1, TimeUnit.MINUTES);
 
         server.start();
-        log.info("편지 서버 시작: 포트 " + config.port() + ", 데이터 폴더 " + config.dataDir().toAbsolutePath());
+        log.info("편지 서버 시작: 포트 " + config.port() + ", 데이터 폴더 " + config.dataDir().toAbsolutePath()
+                + ", 디스코드 전송 " + (discord instanceof DisabledDiscordGateway ? "꺼짐" : "켜짐"));
     }
 
     public void stop() {

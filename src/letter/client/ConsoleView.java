@@ -55,7 +55,8 @@ public class ConsoleView {
         println("\n===== 편지 =====");
         println("1. 편지 쓰기");
         println("2. 편지 확인");
-        println("3. 종료");
+        println("3. 디스코드로 편지 전송하기");
+        println("4. 종료");
     }
 
     public void showLetter(Letter letter) {

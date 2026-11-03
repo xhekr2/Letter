@@ -1,9 +1,13 @@
 package letter.client;
 
+import letter.domain.DiscordId;
+import letter.domain.DiscordUser;
 import letter.domain.Letter;
 import letter.domain.LetterCode;
 import letter.domain.LetterDraft;
 import letter.domain.LetterException;
+import letter.domain.Receipt;
+import letter.protocol.DiscordForm;
 import letter.protocol.FormCodec;
 import letter.protocol.LetterForm;
 
@@ -42,26 +46,37 @@ public class HttpLetterApi implements LetterApi {
 
     @Override
     public LetterCode send(LetterDraft draft) throws ApiException {
-        Map<String, String> fields = new LinkedHashMap<>();
-        fields.put("author", draft.author());
-        fields.put("content", draft.content());
-        String body = FormCodec.encode(fields);
-        if (body.getBytes(StandardCharsets.UTF_8).length > MAX_BODY_BYTES) {
-            throw new ApiException("편지가 너무 깁니다. 조금 줄여서 다시 써 주세요.", false);
-        }
-
-        Reply reply = call(HttpRequest.newBuilder(URI.create(baseUrl + "/letters"))
-                .timeout(REQUEST_TIMEOUT)
-                .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-                .POST(HttpRequest.BodyPublishers.ofString(body))
-                .build());
-
+        Reply reply = postLetter(draft, null);
         if (!reply.ok()) throw reply.toException();
         String code = reply.fields().get("code");
         if (code == null) throw unreadable();
         try {
             return LetterCode.of(code);
         } catch (LetterException e) {
+            throw unreadable();
+        }
+    }
+
+    @Override
+    public Receipt sendToDiscord(LetterDraft draft, DiscordId to) throws ApiException {
+        Reply reply = postLetter(draft, to);
+        if (!reply.ok()) throw reply.toException();
+        try {
+            return DiscordForm.receiptFromBody(reply.body());
+        } catch (IllegalArgumentException e) {
+            throw unreadable();
+        }
+    }
+
+    @Override
+    public DiscordUser findDiscordUser(DiscordId id) throws ApiException {
+        Reply reply = call(HttpRequest.newBuilder(URI.create(baseUrl + "/discord/users/" + id.value()))
+                .timeout(REQUEST_TIMEOUT).GET().build());
+
+        if (!reply.ok()) throw reply.toException();
+        try {
+            return DiscordForm.userFromBody(reply.body());
+        } catch (IllegalArgumentException e) {
             throw unreadable();
         }
     }
@@ -77,6 +92,24 @@ public class HttpLetterApi implements LetterApi {
         } catch (IllegalArgumentException e) {
             throw unreadable();
         }
+    }
+
+    /** 편지 발송 요청. discordId가 있으면 서버가 그 사람에게 코드를 디스코드로 전달한다. */
+    private Reply postLetter(LetterDraft draft, DiscordId discordId) throws ApiException {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("author", draft.author());
+        fields.put("content", draft.content());
+        if (discordId != null) fields.put(DiscordForm.RECIPIENT_FIELD, discordId.value());
+        String body = FormCodec.encode(fields);
+        if (body.getBytes(StandardCharsets.UTF_8).length > MAX_BODY_BYTES) {
+            throw new ApiException("편지가 너무 깁니다. 조금 줄여서 다시 써 주세요.", false);
+        }
+
+        return call(HttpRequest.newBuilder(URI.create(baseUrl + "/letters"))
+                .timeout(REQUEST_TIMEOUT)
+                .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build());
     }
 
     /** 통신 실패를 예외가 아닌 Reply(status -1 / -2)로 바꿔서 위쪽 코드를 단순하게 만든다. */
