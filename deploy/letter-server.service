@@ -15,7 +15,7 @@ Environment=RATE_LIMIT_PER_MIN=600
 # 디스코드 전송 기능: 봇 토큰은 이 서비스 파일이 아니라 별도 파일에 둔다. (파일이 없으면 기능이 꺼진다)
 #   sudo mkdir -p /etc/letter
 #   sudo install -m 600 -o root -g root /dev/null /etc/letter/discord.env
-#   sudo sh -c 'echo DISCORD_BOT_TOKEN=여기에_봇_토큰 > /etc/letter/discord.env'
+#   sudo nano /etc/letter/discord.env    # 파일 안에 한 줄: DISCORD_BOT_TOKEN=발급받은토큰  (명령줄에 직접 쓰면 터미널 기록에 남는다)
 EnvironmentFile=-/etc/letter/discord.env
 ExecStart=/usr/bin/java -cp /opt/letter letter.server.LetterServer
 Restart=on-failure
