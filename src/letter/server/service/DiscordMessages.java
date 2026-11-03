@@ -15,9 +15,9 @@ public final class DiscordMessages {
                 + "\n"
                 + "편지 프로그램에서 '편지 확인'을 고르고 위 코드를 입력하면 읽을 수 있어요.\n"
                 + "※ 보낸 사람 이름은 작성자가 직접 정한 이름이라 실제 보낸 사람과 다를 수 있어요."
-                + "\n \n"
-                + "편지 프로그램이 없다면?" + "\n"
-                + "https://github.com/xhekr2/Letter";
+                + "\n\n"
+                + "편지 프로그램이 없다면? 다운로드 하세요!" + "\n"
+                + "<https://github.com/xhekr2/Letter>";
     }
 
     /**
