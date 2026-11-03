@@ -4,7 +4,7 @@ package letter.domain;
 @SuppressWarnings("serial")
 public class LetterException extends RuntimeException {
 
-    public enum Kind { INVALID, NOT_FOUND, TOO_LARGE, RATE_LIMITED, STORAGE_FAILURE, CORRUPTED }
+    public enum Kind { INVALID, NOT_FOUND, TOO_LARGE, RATE_LIMITED, STORAGE_FAILURE, CORRUPTED, UNAVAILABLE }
 
     private final Kind kind;
 
@@ -27,6 +27,15 @@ public class LetterException extends RuntimeException {
 
     public static LetterException tooLarge(String message) {
         return new LetterException(Kind.TOO_LARGE, message, null);
+    }
+
+    public static LetterException rateLimited(String message) {
+        return new LetterException(Kind.RATE_LIMITED, message, null);
+    }
+
+    /** 외부 연동(디스코드 등)을 지금 쓸 수 없을 때. */
+    public static LetterException unavailable(String message, Throwable cause) {
+        return new LetterException(Kind.UNAVAILABLE, message, cause);
     }
 
     public static LetterException storageFailure(String message, Throwable cause) {

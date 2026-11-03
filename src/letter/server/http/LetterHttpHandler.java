@@ -2,52 +2,44 @@ package letter.server.http;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
+import letter.domain.DiscordId;
 import letter.domain.Letter;
 import letter.domain.LetterCode;
 import letter.domain.LetterDraft;
 import letter.domain.LetterException;
+import letter.domain.Receipt;
+import letter.protocol.DiscordForm;
 import letter.protocol.FormCodec;
 import letter.protocol.LetterForm;
+import letter.server.service.LetterDeliveryService;
 import letter.server.service.LetterService;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 /**
  * HTTP 요청을 서비스 호출로 바꿔 주는 어댑터.
- *   POST /letters        -> 편지 발송
+ *   POST /letters        -> 편지 발송 (discordId 항목이 있으면 그 사람에게 디스코드 봇이 코드를 전달)
  *   GET  /letters/{code} -> 편지 조회
  */
 public class LetterHttpHandler implements HttpHandler {
-    private static final Logger LOG = Logger.getLogger(LetterHttpHandler.class.getName());
     private static final String COLLECTION = "/letters";
     private static final String ITEM_PREFIX = "/letters/";
 
     private final LetterService service;
+    private final LetterDeliveryService delivery;
     private final int maxBodyBytes;
 
-    public LetterHttpHandler(LetterService service, int maxBodyBytes) {
+    public LetterHttpHandler(LetterService service, LetterDeliveryService delivery, int maxBodyBytes) {
         this.service = service;
+        this.delivery = delivery;
         this.maxBodyBytes = maxBodyBytes;
     }
 
     @Override
     public void handle(HttpExchange ex) {
-        try {
-            route(ex);
-        } catch (LetterException e) {
-            if (e.kind() == LetterException.Kind.STORAGE_FAILURE || e.kind() == LetterException.Kind.CORRUPTED) {
-                LOG.log(Level.WARNING, e.getMessage(), e);
-            }
-            HttpResponses.sendError(ex, HttpResponses.statusOf(e.kind()), e.getMessage());
-        } catch (RuntimeException e) {
-            // 예상하지 못한 오류: 자세한 내용은 로그에만 남기고 사용자에게는 일반 메시지만 보낸다
-            LOG.log(Level.SEVERE, "처리 중 예외", e);
-            HttpResponses.sendError(ex, 500, "서버 오류가 발생했습니다.");
-        }
+        HttpResponses.guard(ex, () -> route(ex));
     }
 
     private void route(HttpExchange ex) {
@@ -82,6 +74,14 @@ public class LetterHttpHandler implements HttpHandler {
         }
 
         LetterDraft draft = new LetterDraft(form.get("author"), form.get("content"));
+
+        String recipient = form.get(DiscordForm.RECIPIENT_FIELD);
+        if (recipient != null) {
+            Receipt receipt = delivery.sendTo(draft, DiscordId.of(recipient));
+            HttpResponses.send(ex, 200, DiscordForm.receiptToBody(receipt));
+            return;
+        }
+
         LetterCode code = service.send(draft);
         HttpResponses.send(ex, 200, FormCodec.encode(Map.of("code", code.value())));
     }
