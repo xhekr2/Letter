@@ -127,4 +127,4 @@ PowerShell에서는 `javac -encoding UTF-8 -d out (Get-ChildItem -Recurse src,te
 ## 배포 (Ubuntu VM)
 
 GSMSV를 사용했습니다,
-`deploy/letter-server.service` 와 `Dockerfile` 참고.
+`deploy/letter-server.service` ~~와 `Dockerfile`~~ 참고.
