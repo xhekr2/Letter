@@ -7,6 +7,7 @@ import letter.domain.Letter;
 import letter.domain.LetterCode;
 import letter.domain.LetterDraft;
 import letter.domain.LetterException;
+import letter.domain.OpenedLetter;
 import letter.domain.Receipt;
 
 import java.util.Objects;
@@ -75,7 +76,7 @@ public class LetterApp {
 
     /**
      * 디스코드로 편지 전송하기: 작성(편지 쓰기와 동일) → 발송 확인 → 받는 사람의 디스코드 ID 입력
-     * → 그 사람이 맞는지 최종 확인 → 발송. 디스코드 봇이 받는 사람에게 편지 코드만 전달한다.
+     * → 그 사람이 맞는지 확인 → 답장 수신 여부(답장을 받을 디스코드 ID, 같은 확인 절차) → 발송. 디스코드 봇이 받는 사람에게 편지 코드만 전달한다.
      */
     private void writeToDiscord() {
         LetterDraft draft = compose();
@@ -92,8 +93,11 @@ public class LetterApp {
             return;
         }
 
-        sendWithRetry(() -> api.sendToDiscord(draft, recipient.id()))
-                .ifPresent(receipt -> reportDelivery(recipient, receipt));
+        DiscordUser replyTo = askReplyTarget();   // null이면 답장을 받지 않는다
+
+        DiscordId replyToId = replyTo == null ? null : replyTo.id();
+        sendWithRetry(() -> api.sendToDiscord(draft, recipient.id(), replyToId))
+                .ifPresent(receipt -> reportDelivery(recipient, replyTo, receipt));
     }
 
     /** 작성자와 내용을 입력받아 편지 초안을 만든다. 규칙에 맞지 않으면 안내하고 null. */
@@ -101,6 +105,18 @@ public class LetterApp {
         String author = askAuthor();
 
         view.println("편지 내용을 입력하세요. (끝내려면 새 줄에 /end 만 입력)");
+        String content = readContent();
+
+        try {
+            return new LetterDraft(author, content);
+        } catch (LetterException e) {
+            view.println(e.getMessage() + " 취소했습니다.");
+            return null;
+        }
+    }
+
+    /** "/end"가 나올 때까지 여러 줄을 읽는다. */
+    private String readContent() {
         StringBuilder content = new StringBuilder();
         while (true) {
             String line = view.readLine();
@@ -108,13 +124,7 @@ public class LetterApp {
             if (content.length() > 0) content.append('\n');
             content.append(line);
         }
-
-        try {
-            return new LetterDraft(author, content.toString());
-        } catch (LetterException e) {
-            view.println(e.getMessage() + " 취소했습니다.");
-            return null;
-        }
+        return content.toString();
     }
 
     /**
@@ -124,8 +134,25 @@ public class LetterApp {
     private DiscordUser askRecipient() {
         view.println("\n받는 사람의 디스코드 ID(숫자)를 입력하세요. (취소하려면 비워 두세요)");
         view.println("  ID 확인 방법: 디스코드 설정 → 고급 → 개발자 모드 켜기 → 사용자 우클릭 → '사용자 ID 복사'");
+        return askDiscordUser("디스코드 ID> ", "받는 사람", "이 사람에게 보내는 게 맞나요?");
+    }
+
+    /**
+     * 답장 수신 여부: 답장을 받을 디스코드 ID를 입력받는다. 받는 사람과 같은 조회·확인 절차를 거친다.
+     * 비워 두면 답장을 받지 않는다(null). (답장이 꼭 온다는 보장은 없다)
+     */
+    private DiscordUser askReplyTarget() {
+        view.println("\n답장을 받으시겠어요? 답장을 받을 디스코드 ID(숫자)를 입력하세요. (답장을 받지 않으려면 비워 두세요)");
+        view.println("  받는 사람이 원하면 이 ID로 답장 코드가 전달됩니다. 답장이 꼭 오는 것은 아니에요.");
+        DiscordUser user = askDiscordUser("답장 수신 여부(디스코드 ID)> ", "답장 받을 사용자", "이 사용자가 맞나요?");
+        if (user == null) view.println("답장을 받지 않고 보냅니다.");
+        return user;
+    }
+
+    /** 디스코드 ID 입력 → 서버 조회 → 이름 확인의 공통 절차. 비워 두면 null. */
+    private DiscordUser askDiscordUser(String promptText, String roleLabel, String confirmQuestion) {
         while (true) {
-            String raw = view.prompt("디스코드 ID> ");
+            String raw = view.prompt(promptText);
             if (raw.isBlank()) return null;
 
             DiscordUser user;
@@ -139,8 +166,8 @@ public class LetterApp {
                 continue;
             }
 
-            view.println("\n받는 사람: " + ConsoleView.sanitize(user.name()) + "  (ID " + user.id() + ")");
-            if (view.confirm("이 사람에게 보내는 게 맞나요?")) return user;
+            view.println("\n" + roleLabel + ": " + ConsoleView.sanitize(user.name()) + "  (ID " + user.id() + ")");
+            if (view.confirm(confirmQuestion)) return user;
             view.println("다시 입력해 주세요.");
         }
     }
@@ -161,7 +188,7 @@ public class LetterApp {
         }
     }
 
-    private void reportDelivery(DiscordUser recipient, Receipt receipt) {
+    private void reportDelivery(DiscordUser recipient, DiscordUser replyTo, Receipt receipt) {
         view.println("\n편지를 발송했습니다!");
         if (receipt.delivery() == Delivery.SENT) {
             view.println(ConsoleView.sanitize(recipient.name()) + " 님에게 디스코드로 고유 코드를 전달했어요.");
@@ -169,6 +196,9 @@ public class LetterApp {
             view.println("다만 디스코드로 코드를 전달하지 못했어요.");
             view.println("(상대가 편지 봇과 같은 서버에 있는지, 서버 멤버의 DM 수신을 허용했는지 확인해 주세요)");
             view.println("아래 고유 코드를 상대에게 직접 전달해 주세요.");
+        }
+        if (replyTo != null) {
+            view.println("답장을 받을 사용자: " + ConsoleView.sanitize(replyTo.name()) + " (답장이 올지는 받는 사람에게 달려 있어요)");
         }
         view.println("고유 코드: " + receipt.code());
     }
@@ -191,13 +221,42 @@ public class LetterApp {
             view.println("코드를 입력해 주세요.");
             return;
         }
+        LetterCode code;
+        OpenedLetter opened;
         try {
-            Letter letter = api.read(LetterCode.of(raw));
-            view.showLetter(letter);
+            code = LetterCode.of(raw);
+            opened = api.open(code);
         } catch (LetterException e) {
             view.println(e.getMessage());
+            return;
         } catch (ApiException e) {
             view.println("조회 실패: " + e.getMessage());
+            return;
         }
+
+        view.showLetter(opened.letter());
+        if (opened.replyable() && view.confirm("답장하시겠어요?")) {
+            replyTo(code);
+        }
+    }
+
+    /** 답장 쓰기: 작성자는 따로 적지 않는다. 작성 시각은 서버가 기록하고, 읽는 쪽 화면에 보인다. */
+    private void replyTo(LetterCode original) {
+        view.println("답장 내용을 입력하세요. (끝내려면 새 줄에 /end 만 입력)");
+        String content = readContent();
+        if (content.isBlank()) {
+            view.println("답장 내용이 비어 있어 취소했습니다.");
+            return;
+        }
+
+        sendWithRetry(() -> api.reply(original, content)).ifPresent(receipt -> {
+            if (receipt.delivery() == Delivery.SENT) {
+                view.println("\n답장을 보냈습니다! 디스코드로 답장이 왔다고 알려 드렸어요.");
+            } else {
+                view.println("\n답장은 저장했지만 디스코드로 전달하지 못했어요.");
+                view.println("아래 고유 코드를 원래 편지를 보낸 분께 직접 전달해 주세요.");
+                view.println("고유 코드: " + receipt.code());
+            }
+        });
     }
 }

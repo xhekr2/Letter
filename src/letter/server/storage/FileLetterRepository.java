@@ -41,7 +41,7 @@ public class FileLetterRepository implements LetterRepository {
             throw LetterException.storageFailure("편지를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.", e);
         }
         try {
-            Files.writeString(file, LetterForm.toBody(letter), StandardCharsets.UTF_8);
+            Files.writeString(file, LetterForm.toStoredBody(letter), StandardCharsets.UTF_8);
             return true;
         } catch (IOException e) {
             deleteQuietly(file);                         // 반쯤 쓴 파일이 남지 않게 정리

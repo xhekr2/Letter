@@ -53,13 +53,45 @@ public class LetterDeliveryService {
      * @throws LetterException 같은 사람에게 너무 자주 보내면 RATE_LIMITED (이때는 편지도 저장하지 않는다)
      */
     public Receipt sendTo(LetterDraft draft, DiscordId to) {
+        return sendTo(draft, to, null);
+    }
+
+    /**
+     * 편지를 저장하고 코드를 상대에게 DM으로 보낸다. replyTo가 있으면 그 사람이 이 편지의 답장을 받게 된다.
+     *
+     * @param replyTo 답장을 받을 디스코드 ID (답장을 받지 않으면 null)
+     * @throws LetterException 같은 사람에게 너무 자주 보내면 RATE_LIMITED (이때는 편지도 저장하지 않는다)
+     */
+    public Receipt sendTo(LetterDraft draft, DiscordId to, DiscordId replyTo) {
         if (!targetLimiter.tryAcquire(to.value())) {
             throw LetterException.rateLimited("해당 사용자에게 너무 자주 보내고 있습니다. 잠시 후 다시 시도해 주세요.");
         }
 
-        LetterCode code = letters.send(draft);
+        LetterCode code = letters.send(draft, replyTo);
+        return deliver(to, code, DiscordMessages.letterArrived(draft.author(), code));
+    }
+
+    /**
+     * 원본 편지에 대한 답장을 새 편지로 저장하고, 새 코드를 원본에 저장된 디스코드 ID로 DM 보낸다.
+     * 답장하는 사람은 받는 사람이 누구인지 알 수 없다.
+     *
+     * @throws LetterException 원본이 없으면 NOT_FOUND, 답장을 받지 않는 편지거나 내용이 비었으면 INVALID,
+     *                         답장이 너무 자주 가면 RATE_LIMITED (이때는 저장하지 않는다)
+     */
+    public Receipt reply(LetterCode original, String content) {
+        DiscordId target = letters.replyTargetOf(original);
+        LetterDraft draft = letters.replyDraft(original, content);
+        if (!targetLimiter.tryAcquire(target.value())) {
+            throw LetterException.rateLimited("이 편지에는 지금 답장을 보낼 수 없습니다. 잠시 후 다시 시도해 주세요.");
+        }
+
+        LetterCode code = letters.saveReply(draft);
+        return deliver(target, code, DiscordMessages.replyArrived(original, code));
+    }
+
+    private Receipt deliver(DiscordId to, LetterCode code, String message) {
         try {
-            discord.sendDirectMessage(to, DiscordMessages.letterArrived(draft.author(), code));
+            discord.sendDirectMessage(to, message);
             return new Receipt(code, Delivery.SENT);
         } catch (DiscordGatewayException e) {
             // 받는 사람의 ID와 편지 코드는 로그에 남기지 않는다
