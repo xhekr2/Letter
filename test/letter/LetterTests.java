@@ -13,6 +13,7 @@ import letter.domain.LetterCode;
 import letter.domain.LetterDraft;
 import letter.domain.LetterException;
 import letter.domain.LetterException.Kind;
+import letter.domain.OpenedLetter;
 import letter.domain.Receipt;
 import letter.protocol.DiscordForm;
 import letter.protocol.FormCodec;
@@ -259,6 +260,7 @@ public class LetterTests {
         });
 
         discordTests();
+        replyTests();
 
         System.out.printf("%n결과: %d개 통과, %d개 실패%n", passed, failed);
         if (failed > 0) System.exit(1);
@@ -267,6 +269,7 @@ public class LetterTests {
     // ======================================================================== 디스코드 전송
 
     private static final String ID_HONG = "123456789012345678";
+    private static final String ID_KIM = "987654321098765432";
     private static final String CHANNEL_ID = "555000111222333444";
 
     private static void discordTests() {
@@ -441,7 +444,7 @@ public class LetterTests {
             FakeDiscord discord = new FakeDiscord();
             discord.users.put(ID_HONG, "홍길동 (@gildong)");
             withServer(discord, (server, api, dir) -> {
-                String out = runApp(api, sendFlow + "y\n4\n");
+                String out = runApp(api, sendFlow + "y\n\n4\n")   /* 답장 수신 여부는 비움 */;
                 has(out, "3. 디스코드로 편지 전송하기");
                 has(out, "받는 사람: 홍길동 (@gildong)");
                 has(out, "이 사람에게 보내는 게 맞나요?");
@@ -491,7 +494,7 @@ public class LetterTests {
             discord.users.put(ID_HONG, "홍길동");
             discord.dmFailure = DiscordGatewayException.Reason.DM_NOT_ALLOWED;
             withServer(discord, (server, api, dir) -> {
-                String out = runApp(api, sendFlow + "y\n4\n");
+                String out = runApp(api, sendFlow + "y\n\n4\n")   /* 답장 수신 여부는 비움 */;
                 has(out, "디스코드로 코드를 전달하지 못했어요.");
                 has(out, "직접 전달해 주세요.");
                 eq("안녕하세요\n두번째 줄", api.read(LetterCode.of(codeIn(out))).content());
@@ -528,6 +531,246 @@ public class LetterTests {
                 has(shown, "보낸 사람: 익명");
                 has(shown, "그냥 편지");
                 has(runApp(api, "9\n4\n"), "잘못된 입력입니다.");
+            });
+        });
+    }
+
+    // ---------------------------------------------------------------- 답장 기능 테스트
+
+    private static LetterDeliveryService replyDelivery(FakeDiscord discord, LetterRepository repo, Clock limiterClock, String... codes) {
+        LetterService letters = new LetterService(repo, new SequenceCodeGenerator(codes), FIXED_CLOCK);
+        return new LetterDeliveryService(letters, discord, new RateLimiter(3, Duration.ofMinutes(10), limiterClock));
+    }
+
+    private static void replyTests() {
+        // ---------- 통신/저장 형식 ----------
+        test("답장[형식]: 읽는 사람에게는 replyable만 보내고 답장받을 ID는 절대 보내지 않음", () -> {
+            Letter letter = new Letter("철수", "안녕", LocalDateTime.of(2026, 11, 2, 14, 46), DiscordId.of(ID_KIM));
+            String transfer = LetterForm.toBody(letter);
+            lacks(transfer, ID_KIM);
+            eq(true, LetterForm.replyableFromBody(transfer));
+            eq(null, LetterForm.fromBody(transfer).replyTo());
+            lacks(LetterForm.toBody(new Letter("철수", "안녕", letter.createdAt())), "replyable");
+            eq(false, LetterForm.replyableFromBody(LetterForm.toBody(new Letter("철수", "안녕", letter.createdAt()))));
+        });
+        test("답장[형식]: 저장 형식은 답장받을 ID를 보존하고, 옛 파일(항목 없음)도 그대로 읽힘", () -> {
+            Letter letter = new Letter("철수", "안녕", LocalDateTime.of(2026, 11, 2, 14, 46), DiscordId.of(ID_KIM));
+            eq(letter, LetterForm.fromBody(LetterForm.toStoredBody(letter)));
+            Letter old = LetterForm.fromBody("author=a&content=hi&createdAt=2026-11-02+14%3A46");
+            eq(null, old.replyTo());
+            eq(false, old.replyable());
+        });
+        test("답장[DM 문구]: 원본 코드와 새 코드를 알리고 편지 내용은 없음", () -> {
+            String text = DiscordMessages.replyArrived(LetterCode.of("AAAAAAAA"), LetterCode.of("BBBBBBBB"));
+            has(text, "`AAAAAAAA` 편지에 대한 답장이 도착했어요!");
+            has(text, "고유 코드: `BBBBBBBB`");
+        });
+
+        // ---------- 서비스 ----------
+        test("답장[서비스]: 일반 편지가 '코드에 대한 답장입니다.' 이름을 쓰면 거절 (답장 위조 방지)", () -> {
+            LetterService letters = new LetterService(new InMemoryLetterRepository(), new SequenceCodeGenerator("AAAAAAAA"), FIXED_CLOCK);
+            kind(Kind.INVALID, () -> letters.send(new LetterDraft("AAAAAAAA에 대한 답장입니다.", "x")));
+            kind(Kind.INVALID, () -> letters.send(new LetterDraft("aaaaaaaa에 대한 답장입니다.", "x")));
+            eq("AAAAAAAA", letters.send(new LetterDraft("AAAAAAAA 답장", "x")).value());   // 비슷한 이름은 허용
+        });
+        test("답장[서비스]: 답장은 새 코드·고정 작성자·작성 시각을 갖고, 저장된 ID로 DM이 가며, 답장에는 답장할 수 없음", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            InMemoryLetterRepository repo = new InMemoryLetterRepository();
+            LetterDeliveryService delivery = replyDelivery(discord, repo, FIXED_CLOCK, "AAAAAAAA", "BBBBBBBB");
+            LetterService reader = new LetterService(repo, new SequenceCodeGenerator("ZZZZZZZZ"), FIXED_CLOCK);
+
+            delivery.sendTo(new LetterDraft("철수", "비밀 내용"), DiscordId.of(ID_HONG), DiscordId.of(ID_KIM));
+            Receipt receipt = delivery.reply(LetterCode.of("AAAAAAAA"), "답장 내용");
+
+            eq("BBBBBBBB", receipt.code().value());
+            eq(Delivery.SENT, receipt.delivery());
+            Letter reply = reader.read(receipt.code());
+            eq("AAAAAAAA에 대한 답장입니다.", reply.author());
+            eq("답장 내용", reply.content());
+            eq(LocalDateTime.of(2026, 11, 2, 14, 46), reply.createdAt());
+            eq(false, reply.replyable());
+            eq(2, discord.dms.size());
+            eq(ID_HONG, discord.dms.get(0)[0]);                                // 원래 편지는 받는 사람에게
+            eq(ID_KIM, discord.dms.get(1)[0]);                                 // 답장 코드는 저장된 답장받을 ID로
+            has(discord.dms.get(1)[1], "`AAAAAAAA` 편지에 대한 답장이 도착했어요!");
+            has(discord.dms.get(1)[1], "`BBBBBBBB`");
+            lacks(discord.dms.get(1)[1], "답장 내용");
+            kind(Kind.INVALID, () -> delivery.reply(receipt.code(), "또 답장"));   // 답장에는 답장 불가
+        });
+        test("답장[서비스]: 답장을 받지 않는 편지·없는 편지·빈 내용은 거절하고 아무것도 저장/전송하지 않음", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            InMemoryLetterRepository repo = new InMemoryLetterRepository();
+            LetterDeliveryService delivery = replyDelivery(discord, repo, FIXED_CLOCK, "AAAAAAAA", "BBBBBBBB", "CCCCCCCC");
+            delivery.sendTo(new LetterDraft("철수", "안녕"), DiscordId.of(ID_HONG));          // 답장 없음
+            delivery.sendTo(new LetterDraft("철수", "안녕"), DiscordId.of(ID_HONG), DiscordId.of(ID_KIM));
+            int dms = discord.dms.size();
+
+            kind(Kind.INVALID, () -> delivery.reply(LetterCode.of("AAAAAAAA"), "답장"));
+            kind(Kind.NOT_FOUND, () -> delivery.reply(LetterCode.of("QQQQQQQQ"), "답장"));
+            kind(Kind.INVALID, () -> delivery.reply(LetterCode.of("BBBBBBBB"), "  \n "));
+            eq(dms, discord.dms.size());
+            eq(false, repo.find(LetterCode.of("CCCCCCCC")).isPresent());
+        });
+        test("답장[서비스]: DM이 실패해도 답장은 저장되고 FAILED", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            InMemoryLetterRepository repo = new InMemoryLetterRepository();
+            LetterDeliveryService delivery = replyDelivery(discord, repo, FIXED_CLOCK, "AAAAAAAA", "BBBBBBBB");
+            delivery.sendTo(new LetterDraft("철수", "안녕"), DiscordId.of(ID_HONG), DiscordId.of(ID_KIM));
+            discord.dmFailure = DiscordGatewayException.Reason.DM_NOT_ALLOWED;
+            Receipt receipt = delivery.reply(LetterCode.of("AAAAAAAA"), "답장");
+            eq(Delivery.FAILED, receipt.delivery());
+            eq("답장", repo.find(receipt.code()).orElseThrow().content());
+        });
+        test("답장[서비스]: 답장받을 사람에게 DM이 너무 몰리면 RATE_LIMITED (저장 안 함)", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            InMemoryLetterRepository repo = new InMemoryLetterRepository();
+            LetterDeliveryService delivery = replyDelivery(discord, repo, FIXED_CLOCK, "AAAAAAAA", "BBBBBBB2", "BBBBBBB3", "BBBBBBB4", "BBBBBBB5");
+            delivery.sendTo(new LetterDraft("철수", "안녕"), DiscordId.of(ID_HONG), DiscordId.of(ID_KIM));   // 홍길동 1/3
+            delivery.reply(LetterCode.of("AAAAAAAA"), "1");                                                 // 김 1/3
+            delivery.reply(LetterCode.of("AAAAAAAA"), "2");                                                 // 김 2/3
+            delivery.reply(LetterCode.of("AAAAAAAA"), "3");                                                 // 김 3/3
+            kind(Kind.RATE_LIMITED, () -> delivery.reply(LetterCode.of("AAAAAAAA"), "4"));
+            eq(false, repo.find(LetterCode.of("BBBBBBB5")).isPresent());
+        });
+
+        // ---------- 실제 서버 ----------
+        test("답장[서버]: 편지 조회 응답에 답장받을 ID가 없고, 파일에는 저장되며, 옛 파일도 읽힘", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            withServer(discord, (server, api, dir) -> {
+                Receipt receipt = api.sendToDiscord(new LetterDraft("철수", "안녕"), DiscordId.of(ID_HONG), DiscordId.of(ID_KIM));
+                OpenedLetter opened = api.open(receipt.code());
+                eq(true, opened.replyable());
+                eq("안녕", api.read(receipt.code()).content());                       // 기존 read도 그대로
+                String raw = java.net.http.HttpClient.newHttpClient().send(
+                        java.net.http.HttpRequest.newBuilder(java.net.URI.create("http://127.0.0.1:" + server.port() + "/letters/" + receipt.code())).build(),
+                        java.net.http.HttpResponse.BodyHandlers.ofString()).body();
+                lacks(raw, ID_KIM);
+                has(Files.readString(dir.resolve(receipt.code() + ".txt")), ID_KIM);
+
+                Files.writeString(dir.resolve("OLDOLDOL.txt"), "author=a&content=hi&createdAt=2026-11-02+14%3A46");
+                eq(false, api.open(LetterCode.of("OLDOLDOL")).replyable());
+                kind(Kind.INVALID, () -> {
+                    try {
+                        api.reply(LetterCode.of("OLDOLDOL"), "답장");
+                    } catch (ApiException e) {
+                        throw LetterException.invalid(e.getMessage());
+                    }
+                });
+            });
+        });
+        test("답장[서버]: replyTo는 디스코드 전송과 함께일 때만 허용 (아니면 400, 저장 안 함)", () -> {
+            withServer(new FakeDiscord(), (server, api, dir) -> {
+                for (String body : new String[]{
+                        "author=a&content=hi&replyTo=" + ID_KIM,                                   // 수신자 없음
+                        "author=a&content=hi&discordId=" + ID_HONG + "&replyTo=abc"}) {            // 형식 오류
+                    var res = java.net.http.HttpClient.newHttpClient().send(
+                            java.net.http.HttpRequest.newBuilder(java.net.URI.create("http://127.0.0.1:" + server.port() + "/letters"))
+                                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString(body)).build(),
+                            java.net.http.HttpResponse.BodyHandlers.ofString());
+                    eq(400, res.statusCode());
+                }
+                eq(0, countLetters(dir));
+            });
+        });
+        test("답장[서버]: 메서드/주소 오류 — 답장 주소는 POST만, 조회 주소는 GET만", () -> {
+            withServer(new FakeDiscord(), (server, api, dir) -> {
+                var client = java.net.http.HttpClient.newHttpClient();
+                String base = "http://127.0.0.1:" + server.port() + "/letters/AAAAAAAA";
+                eq(405, client.send(java.net.http.HttpRequest.newBuilder(java.net.URI.create(base + "/replies")).GET().build(),
+                        java.net.http.HttpResponse.BodyHandlers.ofString()).statusCode());
+                eq(404, client.send(java.net.http.HttpRequest.newBuilder(java.net.URI.create(base + "/replies"))
+                                .POST(java.net.http.HttpRequest.BodyPublishers.ofString("content=x")).build(),
+                        java.net.http.HttpResponse.BodyHandlers.ofString()).statusCode());     // 없는 원본
+                eq(400, client.send(java.net.http.HttpRequest.newBuilder(java.net.URI.create(base + "/x")).GET().build(),
+                        java.net.http.HttpResponse.BodyHandlers.ofString()).statusCode());     // 기존 동작 유지
+            });
+        });
+
+        // ---------- 콘솔 흐름 (E2E) ----------
+        test("답장[E2E]: 보내기(답장 수신 ID 지정·확인) → 읽고 '답장하시겠어요?' 수락 → 답장 코드 DM → 답장 확인", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            discord.users.put(ID_HONG, "홍길동");
+            discord.users.put(ID_KIM, "김철수");
+            withServer(discord, (server, api, dir) -> {
+                String sent = runApp(api, "3\n철수\n안녕하세요\n/end\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\ny\n4\n");
+                has(sent, "답장 수신 여부");
+                has(sent, "답장 받을 사용자: 김철수");
+                has(sent, "이 사용자가 맞나요?");
+                String original = codeIn(sent);
+
+                String replied = runApp(api, "2\n" + original + "\ny\n고마워요\n둘째 줄\n/end\n4\n");
+                has(replied, "안녕하세요");
+                has(replied, "답장하시겠어요?");
+                has(replied, "답장을 보냈습니다!");
+                lacks(replied, "작성자 이름");                                             // 답장은 작성자를 묻지 않는다
+                lacks(replied, "김철수");                                                  // 답장하는 쪽은 받는 사람을 모른다
+                eq(2, discord.dms.size());
+                eq(ID_KIM, discord.dms.get(1)[0]);
+                has(discord.dms.get(1)[1], "`" + original + "` 편지에 대한 답장이 도착했어요!");
+                String replyCode = Pattern.compile("고유 코드: `([A-Z2-9]{8})`").matcher(discord.dms.get(1)[1]).results()
+                        .findFirst().orElseThrow().group(1);
+                if (replyCode.equals(original)) throw new AssertionError("새 코드여야 함");
+
+                String shown = runApp(api, "2\n" + replyCode + "\n4\n");
+                has(shown, "보낸 사람: " + original + "에 대한 답장입니다.");
+                has(shown, "작성 시각: 20");
+                has(shown, "고마워요\n둘째 줄");
+                lacks(shown, "답장하시겠어요?");                                          // 답장에는 다시 답장하지 않는다
+            });
+        });
+        test("답장[E2E]: '답장하시겠어요?'를 거절하면 바로 메뉴로 돌아가고 아무것도 보내지 않음", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            discord.users.put(ID_HONG, "홍길동");
+            discord.users.put(ID_KIM, "김철수");
+            withServer(discord, (server, api, dir) -> {
+                String original = codeIn(runApp(api, "3\n철수\n안녕\n/end\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\ny\n4\n"));
+                int letters = countLetters(dir);
+                String out = runApp(api, "2\n" + original + "\nn\n4\n");
+                has(out, "답장하시겠어요?");
+                lacks(out, "답장 내용을 입력하세요");
+                has(out, "프로그램을 종료합니다.");
+                eq(letters, countLetters(dir));
+                eq(1, discord.dms.size());
+            });
+        });
+        test("답장[E2E]: 답장 수신 ID를 비우면 답장 질문이 나오지 않음, 아니라고 하면 다시 입력", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            discord.users.put(ID_HONG, "홍길동");
+            discord.users.put(ID_KIM, "김철수");
+            withServer(discord, (server, api, dir) -> {
+                String none = runApp(api, "3\n철수\n안녕\n/end\ny\n" + ID_HONG + "\ny\n\n4\n");
+                has(none, "답장을 받지 않고 보냅니다.");
+                String code = codeIn(none);
+                lacks(runApp(api, "2\n" + code + "\n4\n"), "답장하시겠어요?");
+                kind(Kind.INVALID, () -> {
+                    try {
+                        api.reply(LetterCode.of(code), "x");
+                    } catch (ApiException e) {
+                        throw LetterException.invalid(e.getMessage());
+                    }
+                });
+
+                String retry = runApp(api, "3\n철수\n안녕\n/end\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\nn\nabc\n" + ID_KIM + "\ny\n4\n");
+                has(retry, "다시 입력해 주세요.");
+                has(retry, "올바르지 않은 디스코드 ID입니다.");
+                has(retry, "답장 받을 사용자: 김철수");
+                eq(true, api.open(LetterCode.of(codeIn(retry))).replyable());
+            });
+        });
+        test("답장[E2E]: 내용이 비면 답장을 취소하고, 답장 DM 실패 시 새 코드를 직접 전달하도록 안내", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            discord.users.put(ID_HONG, "홍길동");
+            discord.users.put(ID_KIM, "김철수");
+            withServer(discord, (server, api, dir) -> {
+                String original = codeIn(runApp(api, "3\n철수\n안녕\n/end\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\ny\n4\n"));
+                int letters = countLetters(dir);
+                has(runApp(api, "2\n" + original + "\ny\n/end\n4\n"), "답장 내용이 비어 있어 취소했습니다.");
+                eq(letters, countLetters(dir));
+
+                discord.dmFailure = DiscordGatewayException.Reason.DM_NOT_ALLOWED;
+                String out = runApp(api, "2\n" + original + "\ny\n답장\n/end\n4\n");
+                has(out, "디스코드로 전달하지 못했어요");
+                has(api.read(LetterCode.of(codeIn(out))).author(), "에 대한 답장입니다.");
             });
         });
     }
