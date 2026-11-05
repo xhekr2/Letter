@@ -20,6 +20,17 @@ public final class DiscordMessages {
                 + "<https://github.com/xhekr2/Letter>";
     }
 
+    /** 답장 도착 안내. 어떤 편지(원본 코드)에 대한 답장인지와, 답장을 읽을 새 코드를 전달한다. */
+    public static String replyArrived(LetterCode original, LetterCode replyCode) {
+        return "💌 " + codeSpan(original.value()) + " 편지에 대한 답장이 도착했어요!\n"
+                + "고유 코드: " + codeSpan(replyCode.value()) + "\n"
+                + "\n"
+                + "편지 프로그램에서 '편지 확인'을 고르고 위 코드를 입력하면 읽을 수 있어요."
+                + "\n\n"
+                + "편지 프로그램이 없다면? 다운로드 하세요!" + "\n"
+                + "<https://github.com/xhekr2/Letter>";
+    }
+
     /**
      * 사용자가 입력한 문자열을 디스코드 서식(링크, 멘션, 굵게 등)이 적용되지 않는 코드 조각(`...`)으로 감싼다.
      * 이름에 URL을 넣어 봇의 메시지로 링크를 퍼뜨리는 일을 막기 위해서다.

@@ -14,6 +14,8 @@ import java.util.Map;
 public final class DiscordForm {
     /** 편지 발송 요청에 디스코드 수신자를 함께 보낼 때 쓰는 항목 이름 */
     public static final String RECIPIENT_FIELD = "discordId";
+    /** 편지 발송 요청에서 "답장을 받을 디스코드 ID"를 보낼 때 쓰는 항목 이름 (수신자 항목과 함께일 때만 유효) */
+    public static final String REPLY_TO_FIELD = "replyTo";
 
     private DiscordForm() {
     }

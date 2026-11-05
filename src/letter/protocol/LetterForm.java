@@ -1,5 +1,6 @@
 package letter.protocol;
 
+import letter.domain.DiscordId;
 import letter.domain.Letter;
 import letter.domain.LetterException;
 
@@ -9,22 +10,42 @@ import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** {@link Letter} 와 전송/저장 형식(author, content, createdAt)의 변환. 기존 파일 형식과 동일하다. */
+/**
+ * {@link Letter} 와 저장/전송 형식의 변환.
+ * 저장 형식({@link #toStoredBody})에는 답장받을 사람의 ID가 들어가고,
+ * 전송 형식({@link #toBody})에는 들어가지 않는다. (읽는 사람에게 ID가 노출되지 않도록 서로 분리)
+ */
 public final class LetterForm {
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm");
+    private static final String REPLY_TO = "replyTo";
+    private static final String REPLYABLE = "replyable";
 
     private LetterForm() {
     }
 
+    /** 파일에 저장하는 형식. 답장받을 ID가 있으면 포함한다. */
+    public static String toStoredBody(Letter letter) {
+        Map<String, String> fields = baseFields(letter);
+        if (letter.replyTo() != null) fields.put(REPLY_TO, letter.replyTo().value());
+        return FormCodec.encode(fields);
+    }
+
+    /** 편지를 읽는 사람에게 보내는 형식. 답장 가능 여부(replyable)만 알리고 ID는 숨긴다. */
     public static String toBody(Letter letter) {
+        Map<String, String> fields = baseFields(letter);
+        if (letter.replyable()) fields.put(REPLYABLE, "true");
+        return FormCodec.encode(fields);
+    }
+
+    private static Map<String, String> baseFields(Letter letter) {
         Map<String, String> fields = new LinkedHashMap<>();
         fields.put("author", letter.author());
         fields.put("content", letter.content());
         fields.put("createdAt", TIME.format(letter.createdAt()));
-        return FormCodec.encode(fields);
+        return fields;
     }
 
-    /** @throws IllegalArgumentException 형식이 올바르지 않거나 항목이 빠졌을 때 */
+    /** 저장 형식과 전송 형식 모두 읽는다. 옛 데이터(replyTo 없음)도 그대로 읽힌다. */
     public static Letter fromBody(String body) {
         try {
             Map<String, String> fields = FormCodec.decode(body);
@@ -33,9 +54,20 @@ public final class LetterForm {
             if (content == null || createdAt == null) {
                 throw new IllegalArgumentException("필수 항목이 없습니다.");
             }
-            return new Letter(fields.get("author"), content, LocalDateTime.parse(createdAt, TIME));
+            String replyTo = fields.get(REPLY_TO);
+            return new Letter(fields.get("author"), content, LocalDateTime.parse(createdAt, TIME),
+                    replyTo == null ? null : DiscordId.of(replyTo));
         } catch (DateTimeException | LetterException e) {
             throw new IllegalArgumentException("편지 데이터 형식이 올바르지 않습니다.", e);
+        }
+    }
+
+    /** 전송 형식의 replyable 항목. 없으면(옛 서버 포함) false. */
+    public static boolean replyableFromBody(String body) {
+        try {
+            return "true".equals(FormCodec.decode(body).get(REPLYABLE));
+        } catch (IllegalArgumentException e) {
+            return false;
         }
     }
 }
