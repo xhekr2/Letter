@@ -83,8 +83,11 @@ public class HttpLetterApi implements LetterApi {
     }
 
     @Override
-    public Receipt reply(LetterCode original, String content) throws ApiException {
-        String body = FormCodec.encode(Map.of("content", content));
+    public Receipt reply(LetterCode original, String content, String password) throws ApiException {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("content", content);
+        if (password != null) fields.put(LetterForm.PASSWORD_FIELD, password);
+        String body = FormCodec.encode(fields);
         if (body.getBytes(StandardCharsets.UTF_8).length > MAX_BODY_BYTES) {
             throw new ApiException("답장이 너무 깁니다. 조금 줄여서 다시 써 주세요.", false);
         }
@@ -103,9 +106,17 @@ public class HttpLetterApi implements LetterApi {
     }
 
     @Override
-    public OpenedLetter open(LetterCode code) throws ApiException {
-        Reply reply = call(HttpRequest.newBuilder(URI.create(baseUrl + "/letters/" + code.value()))
-                .timeout(REQUEST_TIMEOUT).GET().build());
+    public OpenedLetter open(LetterCode code, String password) throws ApiException {
+        HttpRequest request = password == null
+                ? HttpRequest.newBuilder(URI.create(baseUrl + "/letters/" + code.value()))
+                .timeout(REQUEST_TIMEOUT).GET().build()
+                : HttpRequest.newBuilder(URI.create(baseUrl + "/letters/" + code.value() + "/open"))
+                .timeout(REQUEST_TIMEOUT)
+                .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                .POST(HttpRequest.BodyPublishers.ofString(
+                        FormCodec.encode(Map.of(LetterForm.PASSWORD_FIELD, password))))
+                .build();
+        Reply reply = call(request);
 
         if (!reply.ok()) throw reply.toException();
         try {
@@ -120,6 +131,7 @@ public class HttpLetterApi implements LetterApi {
         Map<String, String> fields = new LinkedHashMap<>();
         fields.put("author", draft.author());
         fields.put("content", draft.content());
+        if (draft.password() != null) fields.put(LetterForm.PASSWORD_FIELD, draft.password().value());
         if (discordId != null) fields.put(DiscordForm.RECIPIENT_FIELD, discordId.value());
         if (replyTo != null) fields.put(DiscordForm.REPLY_TO_FIELD, replyTo.value());
         String body = FormCodec.encode(fields);
@@ -201,6 +213,7 @@ public class HttpLetterApi implements LetterApi {
         }
 
         ApiException toException() {
+            if (status == 401 || status == 403) return new PasswordException(error != null ? error : "비밀번호가 필요합니다.", status == 403);
             return new ApiException(error != null ? error : "서버 응답을 이해할 수 없습니다.", retryable());
         }
     }

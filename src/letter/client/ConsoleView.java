@@ -61,7 +61,8 @@ public class ConsoleView {
 
     public void showLetter(Letter letter) {
         println("\n--------------------------------");
-        println("보낸 사람: " + sanitize(letter.author()));
+        println("from: " + sanitize(letter.author()));
+        if (letter.to() != null) println("to: " + sanitize(letter.to().label()));   // 디스코드로 전달된 편지만
         println("작성 시각: " + letter.createdAt().toString().replace('T', ' '));
         println("--------------------------------");
         println(sanitize(letter.content()));

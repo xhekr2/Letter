@@ -36,6 +36,10 @@ public class LetterServer {
     private static final int DM_LIMIT_PER_TARGET = 3;
     private static final Duration DM_LIMIT_WINDOW = Duration.ofMinutes(10);
 
+    /** 비밀번호 무작위 대입을 막기 위해: 편지 하나당 10분에 10번까지 */
+    private static final int PASSWORD_ATTEMPTS_PER_LETTER = 10;
+    private static final Duration PASSWORD_ATTEMPT_WINDOW = Duration.ofMinutes(10);
+
     private final ServerConfig config;
     private final DiscordGateway discordOverride;
     private final Logger log = Logger.getLogger(LetterServer.class.getName());
@@ -62,8 +66,9 @@ public class LetterServer {
     public void start() throws IOException {
         // 부품 조립
         LetterRepository repository = new FileLetterRepository(config.dataDir());
+        RateLimiter passwordAttempts = new RateLimiter(PASSWORD_ATTEMPTS_PER_LETTER, PASSWORD_ATTEMPT_WINDOW, Clock.systemUTC());
         LetterService service = new LetterService(
-                repository, new RandomCodeGenerator(new SecureRandom()), Clock.system(config.zone()));
+                repository, new RandomCodeGenerator(new SecureRandom()), Clock.system(config.zone()), passwordAttempts);
         RateLimiter limiter = new RateLimiter(config.rateLimitPerMinute(), Clock.systemUTC());
 
         DiscordGateway discord = discordOverride != null ? discordOverride
@@ -88,6 +93,7 @@ public class LetterServer {
         });
         cleaner.scheduleAtFixedRate(limiter::evictExpired, 1, 1, TimeUnit.MINUTES);
         cleaner.scheduleAtFixedRate(targetLimiter::evictExpired, 1, 1, TimeUnit.MINUTES);
+        cleaner.scheduleAtFixedRate(service::evictExpiredAttempts, 1, 1, TimeUnit.MINUTES);
 
         server.start();
         log.info("편지 서버 시작: 포트 " + config.port() + ", 데이터 폴더 " + config.dataDir().toAbsolutePath()

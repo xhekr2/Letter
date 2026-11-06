@@ -67,8 +67,8 @@ public class LetterDeliveryService {
             throw LetterException.rateLimited("해당 사용자에게 너무 자주 보내고 있습니다. 잠시 후 다시 시도해 주세요.");
         }
 
-        LetterCode code = letters.send(draft, replyTo);
-        return deliver(to, code, DiscordMessages.letterArrived(draft.author(), code));
+        LetterCode code = letters.send(draft, replyTo, recipientOf(to));
+        return deliver(to, code, DiscordMessages.letterArrived(draft.author(), code, draft.password()));
     }
 
     /**
@@ -79,7 +79,12 @@ public class LetterDeliveryService {
      *                         답장이 너무 자주 가면 RATE_LIMITED (이때는 저장하지 않는다)
      */
     public Receipt reply(LetterCode original, String content) {
-        DiscordId target = letters.replyTargetOf(original);
+        return reply(original, content, null);
+    }
+
+    /** 비밀번호가 걸린 원본이면 password가 맞아야 한다. */
+    public Receipt reply(LetterCode original, String content, String password) {
+        DiscordId target = letters.replyTargetOf(original, password);
         LetterDraft draft = letters.replyDraft(original, content);
         if (!targetLimiter.tryAcquire(target.value())) {
             throw LetterException.rateLimited("이 편지에는 지금 답장을 보낼 수 없습니다. 잠시 후 다시 시도해 주세요.");
@@ -87,6 +92,18 @@ public class LetterDeliveryService {
 
         LetterCode code = letters.saveReply(draft);
         return deliver(target, code, DiscordMessages.replyArrived(original, code));
+    }
+
+    /**
+     * 편지에 "to:"로 보여 줄 받는 사람 정보. 이름은 클라이언트가 아니라 서버가 디스코드에서 직접 조회한다.
+     * (보내는 사람이 받는 사람 표시를 꾸며 낼 수 없게 하기 위해서다.) 조회에 실패하면 ID만 남긴다.
+     */
+    private DiscordUser recipientOf(DiscordId id) {
+        try {
+            return discord.findUser(id).orElseGet(() -> new DiscordUser(id, null));
+        } catch (DiscordGatewayException e) {
+            return new DiscordUser(id, null);
+        }
     }
 
     private Receipt deliver(DiscordId to, LetterCode code, String message) {

@@ -18,8 +18,17 @@ public interface LetterApi {
         return open(code).letter();
     }
 
-    /** 편지를 읽고, 이 편지에 답장할 수 있는지도 함께 알려 준다. */
-    OpenedLetter open(LetterCode code) throws ApiException;
+    /**
+     * 편지를 읽고, 이 편지에 답장할 수 있는지도 함께 알려 준다.
+     *
+     * @throws PasswordException 비밀번호가 걸린 편지에 비밀번호가 없거나 틀렸을 때
+     */
+    default OpenedLetter open(LetterCode code) throws ApiException {
+        return open(code, null);
+    }
+
+    /** 비밀번호를 보내서 편지를 읽는다. (비밀번호가 없는 편지는 password를 null로 둔다) */
+    OpenedLetter open(LetterCode code, String password) throws ApiException;
 
     /** 보내기 전에 "이 사람이 맞나요?"를 확인하기 위해 디스코드 사용자의 이름을 조회한다. */
     DiscordUser findDiscordUser(DiscordId id) throws ApiException;
@@ -33,5 +42,10 @@ public interface LetterApi {
     Receipt sendToDiscord(LetterDraft draft, DiscordId to, DiscordId replyTo) throws ApiException;
 
     /** 답장을 보낸다. 답장 코드는 서버가 원본 편지에 저장된 디스코드 ID로 전달한다. */
-    Receipt reply(LetterCode original, String content) throws ApiException;
+    default Receipt reply(LetterCode original, String content) throws ApiException {
+        return reply(original, content, null);
+    }
+
+    /** 비밀번호가 걸린 편지에 답장할 때는 그 편지의 비밀번호도 함께 보낸다. */
+    Receipt reply(LetterCode original, String content, String password) throws ApiException;
 }
