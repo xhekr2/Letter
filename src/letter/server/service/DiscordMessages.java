@@ -1,6 +1,7 @@
 package letter.server.service;
 
 import letter.domain.LetterCode;
+import letter.domain.Password;
 
 /** 봇이 보내는 DM 문구. 편지 내용은 절대 담지 않고 고유 코드만 전달한다. */
 public final class DiscordMessages {
@@ -9,9 +10,15 @@ public final class DiscordMessages {
     }
 
     public static String letterArrived(String author, LetterCode code) {
+        return letterArrived(author, code, null);
+    }
+
+    /** 비밀번호가 있으면 `|| 비밀번호 ||`(가림 표시)로 함께 알린다. 눌러서 펼쳐 봐야 보인다. */
+    public static String letterArrived(String author, LetterCode code, Password password) {
         return "💌 편지가 도착했어요!\n"
                 + "보낸 사람: " + codeSpan(author) + "\n"
                 + "고유 코드: " + codeSpan(code.value()) + "\n"
+                + (password == null ? "" : "비밀번호: || " + codeSpan(password.value()) + " ||\n")
                 + "\n"
                 + "편지 프로그램에서 '편지 확인'을 고르고 위 코드를 입력하면 읽을 수 있어요.\n"
                 + "※ 보낸 사람 이름은 작성자가 직접 정한 이름이라 실제 보낸 사람과 다를 수 있어요."

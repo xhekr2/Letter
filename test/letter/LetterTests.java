@@ -5,6 +5,7 @@ import letter.client.ConsoleView;
 import letter.client.HttpLetterApi;
 import letter.client.LetterApi;
 import letter.client.LetterApp;
+import letter.client.PasswordException;
 import letter.domain.Delivery;
 import letter.domain.DiscordId;
 import letter.domain.DiscordUser;
@@ -14,6 +15,7 @@ import letter.domain.LetterDraft;
 import letter.domain.LetterException;
 import letter.domain.LetterException.Kind;
 import letter.domain.OpenedLetter;
+import letter.domain.Password;
 import letter.domain.Receipt;
 import letter.protocol.DiscordForm;
 import letter.protocol.FormCodec;
@@ -30,6 +32,7 @@ import letter.server.service.CodeGenerator;
 import letter.server.service.DiscordMessages;
 import letter.server.service.LetterDeliveryService;
 import letter.server.service.LetterService;
+import letter.server.service.PasswordHasher;
 import letter.server.storage.FileLetterRepository;
 import letter.server.storage.InMemoryLetterRepository;
 import letter.server.storage.LetterRepository;
@@ -261,6 +264,7 @@ public class LetterTests {
 
         discordTests();
         replyTests();
+        passwordTests();
 
         System.out.printf("%n결과: %d개 통과, %d개 실패%n", passed, failed);
         if (failed > 0) System.exit(1);
@@ -438,7 +442,7 @@ public class LetterTests {
         });
 
         // ---------- 실제 서버 + 실제 클라이언트 + 콘솔 흐름 (가짜 디스코드만 끼워 넣음) ----------
-        String sendFlow = "3\n철수\n안녕하세요\n두번째 줄\n/end\ny\n" + ID_HONG + "\n";
+        String sendFlow = "3\n철수\n안녕하세요\n두번째 줄\n/end\n\ny\n" + ID_HONG + "\n";
 
         test("[E2E] 메뉴 3: 편지 작성 → ID 입력 → 이름 확인 → 봇이 코드만 DM 전달", () -> {
             FakeDiscord discord = new FakeDiscord();
@@ -474,7 +478,7 @@ public class LetterTests {
         test("[E2E] 없는 디스코드 ID는 안내하고 편지를 보내지 않음", () -> {
             FakeDiscord discord = new FakeDiscord();
             withServer(discord, (server, api, dir) -> {
-                String out = runApp(api, "3\n철수\n안녕\n/end\ny\n111111111111111111\n\n4\n");
+                String out = runApp(api, "3\n철수\n안녕\n/end\n\ny\n111111111111111111\n\n4\n");
                 has(out, "해당 ID의 디스코드 사용자를 찾을 수 없습니다.");
                 eq(0, discord.dms.size());
                 eq(0, countLetters(dir));
@@ -483,7 +487,7 @@ public class LetterTests {
         test("[E2E] ID 형식이 틀리면 서버에 묻기 전에 안내", () -> {
             FakeDiscord discord = new FakeDiscord();
             withServer(discord, (server, api, dir) -> {
-                String out = runApp(api, "3\n철수\n안녕\n/end\ny\nabc\n홍길동#1234\n\n4\n");
+                String out = runApp(api, "3\n철수\n안녕\n/end\n\ny\nabc\n홍길동#1234\n\n4\n");
                 has(out, "올바르지 않은 디스코드 ID입니다.");
                 eq(0, discord.lookups);
                 eq(0, countLetters(dir));
@@ -503,7 +507,7 @@ public class LetterTests {
         });
         test("[E2E] 디스코드 설정이 없는 서버(봇 토큰 없음)는 안내하고 편지를 보내지 않음", () -> {
             withServer(null, (server, api, dir) -> {                                // 토큰도 가짜도 없음 = 기능 꺼짐
-                String out = runApp(api, "3\n철수\n안녕\n/end\ny\n" + ID_HONG + "\n\n4\n");
+                String out = runApp(api, "3\n철수\n안녕\n/end\n\ny\n" + ID_HONG + "\n\n4\n");
                 has(out, "이 서버에서는 디스코드 전송 기능을 사용할 수 없습니다.");
                 eq(0, countLetters(dir));
             });
@@ -524,11 +528,11 @@ public class LetterTests {
         });
         test("[E2E] 기존 메뉴(편지 쓰기·편지 확인·종료)는 그대로 동작", () -> {
             withServer(new FakeDiscord(), (server, api, dir) -> {
-                String out = runApp(api, "1\n\n그냥 편지\n/end\ny\n4\n");
+                String out = runApp(api, "1\n\n그냥 편지\n/end\n\ny\n4\n");
                 has(out, "프로그램을 종료합니다.");
                 String code = codeIn(out);
                 String shown = runApp(api, "2\n" + code + "\n4\n");
-                has(shown, "보낸 사람: 익명");
+                has(shown, "from: 익명");
                 has(shown, "그냥 편지");
                 has(runApp(api, "9\n4\n"), "잘못된 입력입니다.");
             });
@@ -692,7 +696,7 @@ public class LetterTests {
             discord.users.put(ID_HONG, "홍길동");
             discord.users.put(ID_KIM, "김철수");
             withServer(discord, (server, api, dir) -> {
-                String sent = runApp(api, "3\n철수\n안녕하세요\n/end\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\ny\n4\n");
+                String sent = runApp(api, "3\n철수\n안녕하세요\n/end\n\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\ny\n4\n");
                 has(sent, "답장 수신 여부");
                 has(sent, "답장 받을 사용자: 김철수");
                 has(sent, "이 사용자가 맞나요?");
@@ -712,7 +716,7 @@ public class LetterTests {
                 if (replyCode.equals(original)) throw new AssertionError("새 코드여야 함");
 
                 String shown = runApp(api, "2\n" + replyCode + "\n4\n");
-                has(shown, "보낸 사람: " + original + "에 대한 답장입니다.");
+                has(shown, "from: " + original + "에 대한 답장입니다.");
                 has(shown, "작성 시각: 20");
                 has(shown, "고마워요\n둘째 줄");
                 lacks(shown, "답장하시겠어요?");                                          // 답장에는 다시 답장하지 않는다
@@ -723,7 +727,7 @@ public class LetterTests {
             discord.users.put(ID_HONG, "홍길동");
             discord.users.put(ID_KIM, "김철수");
             withServer(discord, (server, api, dir) -> {
-                String original = codeIn(runApp(api, "3\n철수\n안녕\n/end\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\ny\n4\n"));
+                String original = codeIn(runApp(api, "3\n철수\n안녕\n/end\n\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\ny\n4\n"));
                 int letters = countLetters(dir);
                 String out = runApp(api, "2\n" + original + "\nn\n4\n");
                 has(out, "답장하시겠어요?");
@@ -738,7 +742,7 @@ public class LetterTests {
             discord.users.put(ID_HONG, "홍길동");
             discord.users.put(ID_KIM, "김철수");
             withServer(discord, (server, api, dir) -> {
-                String none = runApp(api, "3\n철수\n안녕\n/end\ny\n" + ID_HONG + "\ny\n\n4\n");
+                String none = runApp(api, "3\n철수\n안녕\n/end\n\ny\n" + ID_HONG + "\ny\n\n4\n");
                 has(none, "답장을 받지 않고 보냅니다.");
                 String code = codeIn(none);
                 lacks(runApp(api, "2\n" + code + "\n4\n"), "답장하시겠어요?");
@@ -750,7 +754,7 @@ public class LetterTests {
                     }
                 });
 
-                String retry = runApp(api, "3\n철수\n안녕\n/end\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\nn\nabc\n" + ID_KIM + "\ny\n4\n");
+                String retry = runApp(api, "3\n철수\n안녕\n/end\n\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\nn\nabc\n" + ID_KIM + "\ny\n4\n");
                 has(retry, "다시 입력해 주세요.");
                 has(retry, "올바르지 않은 디스코드 ID입니다.");
                 has(retry, "답장 받을 사용자: 김철수");
@@ -762,7 +766,7 @@ public class LetterTests {
             discord.users.put(ID_HONG, "홍길동");
             discord.users.put(ID_KIM, "김철수");
             withServer(discord, (server, api, dir) -> {
-                String original = codeIn(runApp(api, "3\n철수\n안녕\n/end\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\ny\n4\n"));
+                String original = codeIn(runApp(api, "3\n철수\n안녕\n/end\n\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\ny\n4\n"));
                 int letters = countLetters(dir);
                 has(runApp(api, "2\n" + original + "\ny\n/end\n4\n"), "답장 내용이 비어 있어 취소했습니다.");
                 eq(letters, countLetters(dir));
@@ -771,6 +775,282 @@ public class LetterTests {
                 String out = runApp(api, "2\n" + original + "\ny\n답장\n/end\n4\n");
                 has(out, "디스코드로 전달하지 못했어요");
                 has(api.read(LetterCode.of(codeIn(out))).author(), "에 대한 답장입니다.");
+            });
+        });
+    }
+
+    // ---------------------------------------------------------------- 비밀번호 / from·to 표시 테스트
+
+    private static java.net.http.HttpResponse<String> http(String method, String url, String body) throws Exception {
+        var builder = java.net.http.HttpRequest.newBuilder(java.net.URI.create(url));
+        if (body == null) builder.method(method, java.net.http.HttpRequest.BodyPublishers.noBody());
+        else builder.method(method, java.net.http.HttpRequest.BodyPublishers.ofString(body));
+        return java.net.http.HttpClient.newHttpClient().send(builder.build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static void passwordTests() {
+        // ---------- 도메인 / 형식 ----------
+        test("비밀번호[도메인]: 비우면 없음, 공백 정리, 30자까지, '|'·'`'·제어문자는 거절", () -> {
+            eq(null, Password.ofOptional(null));
+            eq(null, Password.ofOptional("   "));
+            eq("비밀 1234", Password.ofOptional("  비밀 1234 ").value());
+            eq(30, new Password("가".repeat(30)).value().length());
+            for (String bad : new String[]{"가".repeat(31), "a|b", "||", "a`b", "a\u0007b", "a\nb"}) {
+                kind(Kind.INVALID, () -> new Password(bad));
+            }
+            eq("Password[****]", new Password("secret").toString());                     // 로그에 원문이 찍히지 않는다
+            lacks(new LetterDraft("a", "b", new Password("secret")).toString(), "secret");
+        });
+        test("비밀번호[해시]: 원문이 남지 않고, 맞는 값만 통과하며, 같은 비밀번호도 매번 다른 해시", () -> {
+            Password pw = new Password("비밀1234");
+            String h1 = PasswordHasher.hash(pw);
+            String h2 = PasswordHasher.hash(pw);
+            lacks(h1, "비밀1234");
+            has(h1, "pbkdf2$");
+            if (h1.equals(h2)) throw new AssertionError("소금이 매번 달라야 함");
+            eq(true, PasswordHasher.matches(pw, h1));
+            eq(true, PasswordHasher.matches(pw, h2));
+            eq(false, PasswordHasher.matches(new Password("비밀12345"), h1));
+            for (String broken : new String[]{"", "x", "pbkdf2$abc$!!$!!", "md5$1$a$b", "pbkdf2$100000$AAAA"}) {
+                eq(false, PasswordHasher.matches(pw, broken));
+            }
+        });
+        test("to 표기: 이름(@핸들, ID) 형식, 이름을 모르면 ID만, 핸들만 있으면 핸들을 이름처럼", () -> {
+            DiscordId id = DiscordId.of(ID_HONG);
+            eq("홍길동(@gildong, " + ID_HONG + ")", new DiscordUser(id, "홍길동 (@gildong)").label());
+            eq("gildong(@gildong, " + ID_HONG + ")", new DiscordUser(id, "@gildong").label());
+            eq(ID_HONG, new DiscordUser(id, null).label());
+            eq("철수(" + ID_HONG + ")", new DiscordUser(id, "철수").label());
+            eq("a (@b)(@c, " + ID_HONG + ")", new DiscordUser(id, "a (@b) (@c)").label());   // 이름 안의 괄호는 그대로
+        });
+        test("비밀번호[형식]: 읽는 사람에게는 해시·답장받을 ID 없이 to만, 저장 형식에는 모두 보존, 옛 데이터도 읽힘", () -> {
+            Letter letter = new Letter("철수", "안녕", LocalDateTime.of(2026, 11, 2, 14, 46), DiscordId.of(ID_KIM),
+                    new DiscordUser(DiscordId.of(ID_HONG), "홍길동 (@gildong)"), PasswordHasher.hash(new Password("pw1")));
+            String transfer = LetterForm.toBody(letter);
+            lacks(transfer, "pbkdf2");
+            lacks(transfer, ID_KIM);
+            Letter received = LetterForm.fromBody(transfer);
+            eq(letter.to(), received.to());
+            eq(null, received.passwordHash());
+            eq(letter, LetterForm.fromBody(LetterForm.toStoredBody(letter)));
+            Letter old = LetterForm.fromBody("author=a&content=hi&createdAt=2026-11-02+14%3A46");
+            eq(null, old.to());
+            eq(false, old.passwordProtected());
+        });
+        test("비밀번호[DM 문구]: 비밀번호가 있으면 || `비밀번호` || 로 가려서 알리고, 없으면 줄 자체가 없음", () -> {
+            LetterCode code = LetterCode.of("AB23CD45");
+            has(DiscordMessages.letterArrived("철수", code, new Password("a_b*c")), "비밀번호: || `a_b*c` ||");
+            lacks(DiscordMessages.letterArrived("철수", code, null), "비밀번호");
+            lacks(DiscordMessages.letterArrived("철수", code), "||");
+        });
+
+        // ---------- 서비스 ----------
+        test("비밀번호[서비스]: 해시로만 저장하고, 없음/틀림/맞음을 구분하며, 비밀번호 없는 편지는 그대로 열림", () -> {
+            InMemoryLetterRepository repo = new InMemoryLetterRepository();
+            LetterService letters = new LetterService(repo, new SequenceCodeGenerator("AAAAAAAA", "BBBBBBBB"), FIXED_CLOCK);
+            LetterCode locked = letters.send(new LetterDraft("철수", "비밀 편지", new Password("열쇠1")));
+            LetterCode open = letters.send(new LetterDraft("철수", "공개 편지"));
+
+            String stored = repo.find(locked).orElseThrow().passwordHash();
+            lacks(stored, "열쇠1");
+            kind(Kind.PASSWORD_REQUIRED, () -> letters.open(locked, null));
+            kind(Kind.PASSWORD_REQUIRED, () -> letters.open(locked, "  "));
+            kind(Kind.PASSWORD_WRONG, () -> letters.open(locked, "열쇠2"));
+            kind(Kind.PASSWORD_WRONG, () -> letters.open(locked, "a|b"));                  // 형식이 틀린 입력도 그냥 '틀림'
+            eq("비밀 편지", letters.open(locked, "열쇠1").content());
+            eq("비밀 편지", letters.open(locked, " 열쇠1 ").content());                     // 앞뒤 공백은 무시
+            eq("공개 편지", letters.open(open, null).content());
+            eq("공개 편지", letters.open(open, "아무거나").content());
+            kind(Kind.NOT_FOUND, () -> letters.open(LetterCode.of("QQQQQQQQ"), "x"));
+        });
+        test("비밀번호[서비스]: 한 편지에 비밀번호를 너무 여러 번 대 보면 RATE_LIMITED (맞는 비밀번호도 잠시 거절)", () -> {
+            MutableClock clock = new MutableClock();
+            LetterService letters = new LetterService(new InMemoryLetterRepository(), new SequenceCodeGenerator("AAAAAAAA", "BBBBBBBB"),
+                    FIXED_CLOCK, new RateLimiter(3, Duration.ofMinutes(10), clock));
+            LetterCode locked = letters.send(new LetterDraft("철수", "내용", new Password("열쇠1")));
+            LetterCode other = letters.send(new LetterDraft("철수", "내용", new Password("열쇠1")));
+            for (int i = 0; i < 3; i++) kind(Kind.PASSWORD_WRONG, () -> letters.open(locked, "틀림"));
+            kind(Kind.RATE_LIMITED, () -> letters.open(locked, "열쇠1"));
+            eq("내용", letters.open(other, "열쇠1").content());                             // 다른 편지는 영향 없음
+            clock.advanceSeconds(11 * 60);
+            eq("내용", letters.open(locked, "열쇠1").content());                            // 시간이 지나면 풀림
+        });
+        test("비밀번호[서비스]: 디스코드 전송 — 받는 사람은 서버가 조회해서 저장, DM에는 가려진 비밀번호만, 편지 내용은 없음", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            discord.users.put(ID_HONG, "홍길동 (@gildong)");
+            InMemoryLetterRepository repo = new InMemoryLetterRepository();
+            LetterDeliveryService delivery = replyDelivery(discord, repo, FIXED_CLOCK, "AAAAAAAA");
+
+            Receipt receipt = delivery.sendTo(new LetterDraft("철수", "비밀 내용", new Password("열쇠1")), DiscordId.of(ID_HONG));
+            eq(Delivery.SENT, receipt.delivery());
+            Letter stored = repo.find(receipt.code()).orElseThrow();
+            eq("홍길동 (@gildong)", stored.to().name());
+            eq(ID_HONG, stored.to().id().value());
+            has(discord.dms.get(0)[1], "비밀번호: || `열쇠1` ||");
+            lacks(discord.dms.get(0)[1], "비밀 내용");
+        });
+        test("비밀번호[서비스]: 받는 사람 조회에 실패해도 편지는 저장되고 to는 ID만 남음", () -> {
+            FakeDiscord discord = new FakeDiscord();                                         // 등록된 사용자 없음
+            InMemoryLetterRepository repo = new InMemoryLetterRepository();
+            LetterDeliveryService delivery = replyDelivery(discord, repo, FIXED_CLOCK, "AAAAAAAA");
+            Receipt receipt = delivery.sendTo(new LetterDraft("철수", "안녕"), DiscordId.of(ID_HONG));
+            eq(ID_HONG, repo.find(receipt.code()).orElseThrow().to().label());
+        });
+        test("비밀번호[서비스]: 비밀번호가 걸린 편지는 비밀번호를 알아야 답장할 수 있고, 답장 편지에는 비밀번호·to가 없음", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            discord.users.put(ID_HONG, "홍길동");
+            InMemoryLetterRepository repo = new InMemoryLetterRepository();
+            LetterDeliveryService delivery = replyDelivery(discord, repo, FIXED_CLOCK, "AAAAAAAA", "BBBBBBBB");
+            delivery.sendTo(new LetterDraft("철수", "안녕", new Password("열쇠1")), DiscordId.of(ID_HONG), DiscordId.of(ID_KIM));
+            int dms = discord.dms.size();
+
+            kind(Kind.PASSWORD_REQUIRED, () -> delivery.reply(LetterCode.of("AAAAAAAA"), "답장"));
+            kind(Kind.PASSWORD_WRONG, () -> delivery.reply(LetterCode.of("AAAAAAAA"), "답장", "틀림"));
+            eq(dms, discord.dms.size());
+            Receipt receipt = delivery.reply(LetterCode.of("AAAAAAAA"), "답장", "열쇠1");
+            Letter reply = repo.find(receipt.code()).orElseThrow();
+            eq(false, reply.passwordProtected());
+            eq(null, reply.to());
+        });
+
+        // ---------- 실제 서버 ----------
+        test("비밀번호[서버]: 조회 401 → 틀리면 403 → 맞으면 200, 응답에 해시·답장받을 ID 없음, 파일에도 원문 없음", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            discord.users.put(ID_HONG, "홍길동 (@gildong)");
+            withServer(discord, (server, api, dir) -> {
+                String base = "http://127.0.0.1:" + server.port() + "/letters/";
+                Receipt receipt = api.sendToDiscord(new LetterDraft("철수", "비밀 내용", new Password("열쇠1")),
+                        DiscordId.of(ID_HONG), DiscordId.of(ID_KIM));
+                String code = receipt.code().value();
+
+                var needed = http("GET", base + code, null);
+                eq(401, needed.statusCode());
+                lacks(needed.body(), "비밀%20내용");
+                lacks(java.net.URLDecoder.decode(needed.body(), StandardCharsets.UTF_8), "비밀 내용");
+                eq(403, http("POST", base + code + "/open", "password=" + java.net.URLEncoder.encode("틀림", StandardCharsets.UTF_8)).statusCode());
+                eq(401, http("POST", base + code + "/open", "x=y").statusCode());                       // 비밀번호 항목이 없으면 '필요함'
+                var ok = http("POST", base + code + "/open", "password=" + java.net.URLEncoder.encode("열쇠1", StandardCharsets.UTF_8));
+                eq(200, ok.statusCode());
+                lacks(ok.body(), "pbkdf2");
+                lacks(ok.body(), ID_KIM);
+                has(ok.body(), "toId=" + ID_HONG);
+                eq("비밀 내용", LetterForm.fromBody(ok.body()).content());
+
+                String file = Files.readString(dir.resolve(code + ".txt"));
+                lacks(java.net.URLDecoder.decode(file, StandardCharsets.UTF_8), "열쇠1");
+                has(file, "pw=pbkdf2");
+                eq(405, http("GET", base + code + "/open", null).statusCode());
+            });
+        });
+        test("비밀번호[서버]: 규칙에 맞지 않는 비밀번호로 보내면 400이고 저장하지 않음", () -> {
+            withServer(new FakeDiscord(), (server, api, dir) -> {
+                for (String pw : new String[]{"a|b", "a`b", "가".repeat(31)}) {
+                    var res = http("POST", "http://127.0.0.1:" + server.port() + "/letters",
+                            "author=a&content=hi&password=" + java.net.URLEncoder.encode(pw, StandardCharsets.UTF_8));
+                    eq(400, res.statusCode());
+                }
+                eq(0, countLetters(dir));
+            });
+        });
+        test("비밀번호[서버]: 비밀번호 있는 일반 편지(디스코드 아님)도 같은 규칙, to는 없음", () -> {
+            withServer(new FakeDiscord(), (server, api, dir) -> {
+                LetterCode code = api.send(new LetterDraft("철수", "안녕", new Password("열쇠1")));
+                try {
+                    api.open(code);
+                    throw new AssertionError("비밀번호 없이 열림");
+                } catch (PasswordException e) {
+                    eq(false, e.isWrong());
+                }
+                try {
+                    api.open(code, "틀림");
+                    throw new AssertionError("틀린 비밀번호로 열림");
+                } catch (PasswordException e) {
+                    eq(true, e.isWrong());
+                }
+                OpenedLetter opened = api.open(code, "열쇠1");
+                eq("안녕", opened.letter().content());
+                eq(null, opened.letter().to());
+            });
+        });
+
+        // ---------- 콘솔 흐름 (E2E) ----------
+        test("비밀번호[E2E]: 메뉴 1 — 작성 후 비밀번호 입력, 읽을 때 틀리면 다시, 맞으면 열림, from만 보이고 to는 없음", () -> {
+            withServer(new FakeDiscord(), (server, api, dir) -> {
+                String sent = runApp(api, "1\n철수\n안녕하세요\n/end\n열쇠1\ny\n4\n");
+                has(sent, "비밀번호> ");
+                has(sent, "비밀번호가 걸린 편지예요.");
+                String code = codeIn(sent);
+
+                String shown = runApp(api, "2\n" + code + "\n틀림\n열쇠1\n4\n");
+                has(shown, "비밀번호가 걸린 편지예요.");
+                has(shown, "비밀번호가 올바르지 않습니다.");
+                has(shown, "from: 철수");
+                has(shown, "안녕하세요");
+                lacks(shown, "to: ");
+                has(shown, "작성 시각: 20");
+
+                String cancelled = runApp(api, "2\n" + code + "\n\n4\n");                  // 비워 두면 취소
+                has(cancelled, "취소했습니다.");
+                lacks(cancelled, "안녕하세요");
+                String tooMany = runApp(api, "2\n" + code + "\na\nb\nc\n열쇠1\n4\n");        // 3번 틀리면 중단(맞는 값도 읽히지 않음)
+                has(tooMany, "비밀번호를 여러 번 틀려 취소했습니다.");
+                lacks(tooMany, "안녕하세요");
+            });
+        });
+        test("비밀번호[E2E]: 규칙에 안 맞는 비밀번호는 안내하고 다시 입력받음, 비우면 비밀번호 없는 편지", () -> {
+            withServer(new FakeDiscord(), (server, api, dir) -> {
+                String out = runApp(api, "1\n철수\n안녕\n/end\na|b\n열쇠1\ny\n4\n");
+                has(out, "비밀번호에는 '|' 와 '`' 를 쓸 수 없습니다.");
+                eq(true, api.open(LetterCode.of(codeIn(out)), "열쇠1").letter().content().equals("안녕"));
+
+                String plain = runApp(api, "1\n철수\n공개\n/end\n\ny\n4\n");
+                lacks(plain, "비밀번호가 걸린 편지예요.");
+                String shown = runApp(api, "2\n" + codeIn(plain) + "\n4\n");
+                lacks(shown, "비밀번호");
+                has(shown, "공개");
+            });
+        });
+        test("비밀번호[E2E]: 메뉴 3 — DM에 가려진 비밀번호, 읽으면 from/to(이름·핸들·ID) 표시, 비밀번호 편지에 답장 가능", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            discord.users.put(ID_HONG, "홍길동 (@gildong)");
+            discord.users.put(ID_KIM, "김철수");
+            withServer(discord, (server, api, dir) -> {
+                String sent = runApp(api, "3\n철수\n안녕하세요\n/end\n열쇠1\ny\n" + ID_HONG + "\ny\n" + ID_KIM + "\ny\n4\n");
+                has(sent, "비밀번호는 가려진 상태(|| ||)로 함께 전달했어요.");
+                String code = codeIn(sent);
+                has(discord.dms.get(0)[1], "비밀번호: || `열쇠1` ||");
+                lacks(discord.dms.get(0)[1], "안녕하세요");
+
+                String replied = runApp(api, "2\n" + code + "\n열쇠1\ny\n고마워요\n/end\n4\n");
+                has(replied, "from: 철수");
+                has(replied, "to: 홍길동(@gildong, " + ID_HONG + ")");
+                has(replied, "답장하시겠어요?");
+                has(replied, "답장을 보냈습니다!");                                         // 열 때 입력한 비밀번호로 답장도 통과
+
+                String replyCode = Pattern.compile("고유 코드: `([A-Z2-9]{8})`").matcher(discord.dms.get(1)[1]).results()
+                        .findFirst().orElseThrow().group(1);
+                String reply = runApp(api, "2\n" + replyCode + "\n4\n");                     // 답장 편지에는 비밀번호 없음
+                has(reply, "from: " + code + "에 대한 답장입니다.");
+                lacks(reply, "to: ");
+                has(reply, "고마워요");
+            });
+        });
+        test("비밀번호[E2E]: 메뉴 3 DM 전달 실패 시 코드와 비밀번호를 직접 전달하도록 안내", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            discord.users.put(ID_HONG, "홍길동");
+            discord.dmFailure = DiscordGatewayException.Reason.DM_NOT_ALLOWED;
+            withServer(discord, (server, api, dir) -> {
+                String out = runApp(api, "3\n철수\n안녕\n/end\n열쇠1\ny\n" + ID_HONG + "\ny\n\n4\n");
+                has(out, "고유 코드와 설정한 비밀번호를 상대에게 직접 전달해 주세요.");
+            });
+        });
+        test("비밀번호[호환]: 비밀번호 없는 옛 편지는 옛 방식(GET)으로 그대로 열리고 to 줄이 없음", () -> {
+            withServer(new FakeDiscord(), (server, api, dir) -> {
+                Files.writeString(dir.resolve("OLDOLDOL.txt"), "author=a&content=hi&createdAt=2026-11-02+14%3A46");
+                var res = http("GET", "http://127.0.0.1:" + server.port() + "/letters/OLDOLDOL", null);
+                eq(200, res.statusCode());
+                eq("hi", LetterForm.fromBody(res.body()).content());
+                lacks(runApp(api, "2\nOLDOLDOL\n4\n"), "to: ");
             });
         });
     }

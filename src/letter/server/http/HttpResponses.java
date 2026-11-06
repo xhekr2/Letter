@@ -58,6 +58,8 @@ public final class HttpResponses {
     public static int statusOf(LetterException.Kind kind) {
         return switch (kind) {
             case INVALID -> 400;
+            case PASSWORD_REQUIRED -> 401;
+            case PASSWORD_WRONG -> 403;
             case NOT_FOUND -> 404;
             case TOO_LARGE -> 413;
             case RATE_LIMITED -> 429;

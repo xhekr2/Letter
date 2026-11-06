@@ -7,6 +7,7 @@ import letter.domain.Letter;
 import letter.domain.LetterCode;
 import letter.domain.LetterDraft;
 import letter.domain.LetterException;
+import letter.domain.Password;
 import letter.domain.OpenedLetter;
 import letter.domain.Receipt;
 
@@ -71,6 +72,9 @@ public class LetterApp {
         sendWithRetry(() -> api.send(draft)).ifPresent(code -> {
             view.println("\n편지를 발송했습니다!");
             view.println("고유 코드: " + code + "  (편지를 확인할 때 필요하니 꼭 기억해 두세요)");
+            if (draft.password() != null) {
+                view.println("비밀번호가 걸린 편지예요. 읽을 사람에게 고유 코드와 비밀번호를 함께 알려 주세요.");
+            }
         });
     }
 
@@ -97,7 +101,7 @@ public class LetterApp {
 
         DiscordId replyToId = replyTo == null ? null : replyTo.id();
         sendWithRetry(() -> api.sendToDiscord(draft, recipient.id(), replyToId))
-                .ifPresent(receipt -> reportDelivery(recipient, replyTo, receipt));
+                .ifPresent(receipt -> reportDelivery(recipient, replyTo, draft.password() != null, receipt));
     }
 
     /** 작성자와 내용을 입력받아 편지 초안을 만든다. 규칙에 맞지 않으면 안내하고 null. */
@@ -108,10 +112,25 @@ public class LetterApp {
         String content = readContent();
 
         try {
-            return new LetterDraft(author, content);
+            new LetterDraft(author, content);   // 내용이 비어 있으면 비밀번호를 묻기 전에 알린다
         } catch (LetterException e) {
             view.println(e.getMessage() + " 취소했습니다.");
             return null;
+        }
+
+        return new LetterDraft(author, content, askPassword());
+    }
+
+    /** 편지에 걸 비밀번호를 입력받는다. 비우면 비밀번호 없음(null). 규칙에 맞지 않으면 다시 입력받는다. */
+    private Password askPassword() {
+        view.println("\n비밀번호를 걸면 읽을 때 입력해야 해요. (비우면 비밀번호 없음)");
+        while (true) {
+            String raw = view.prompt("비밀번호> ");
+            try {
+                return Password.ofOptional(raw);   // 규칙은 도메인이 판단한다
+            } catch (LetterException e) {
+                view.println(e.getMessage());
+            }
         }
     }
 
@@ -188,14 +207,16 @@ public class LetterApp {
         }
     }
 
-    private void reportDelivery(DiscordUser recipient, DiscordUser replyTo, Receipt receipt) {
+    private void reportDelivery(DiscordUser recipient, DiscordUser replyTo, boolean hasPassword, Receipt receipt) {
         view.println("\n편지를 발송했습니다!");
         if (receipt.delivery() == Delivery.SENT) {
             view.println(ConsoleView.sanitize(recipient.name()) + " 님에게 디스코드로 고유 코드를 전달했어요.");
+            if (hasPassword) view.println("비밀번호는 가려진 상태(|| ||)로 함께 전달했어요.");
         } else {
             view.println("다만 디스코드로 코드를 전달하지 못했어요.");
             view.println("(상대가 편지 봇과 같은 서버에 있는지, 서버 멤버의 DM 수신을 허용했는지 확인해 주세요)");
-            view.println("아래 고유 코드를 상대에게 직접 전달해 주세요.");
+            view.println(hasPassword ? "아래 고유 코드와 설정한 비밀번호를 상대에게 직접 전달해 주세요."
+                    : "아래 고유 코드를 상대에게 직접 전달해 주세요.");
         }
         if (replyTo != null) {
             view.println("답장을 받을 사용자: " + ConsoleView.sanitize(replyTo.name()) + " (답장이 올지는 받는 사람에게 달려 있어요)");
@@ -215,6 +236,8 @@ public class LetterApp {
         }
     }
 
+    private static final int MAX_PASSWORD_TRIES = 3;
+
     private void read() {
         String raw = view.prompt("고유 코드> ");
         if (raw.isBlank()) {
@@ -222,26 +245,44 @@ public class LetterApp {
             return;
         }
         LetterCode code;
-        OpenedLetter opened;
         try {
             code = LetterCode.of(raw);
-            opened = api.open(code);
         } catch (LetterException e) {
             view.println(e.getMessage());
             return;
-        } catch (ApiException e) {
-            view.println("조회 실패: " + e.getMessage());
-            return;
+        }
+
+        String password = null;      // 비밀번호가 걸린 편지면 입력받아 두었다가 답장에도 쓴다
+        OpenedLetter opened;
+        for (int tries = 0; ; tries++) {
+            try {
+                opened = api.open(code, password);
+                break;
+            } catch (PasswordException e) {
+                view.println(e.isWrong() ? e.getMessage() : "비밀번호가 걸린 편지예요.");
+                if (tries >= MAX_PASSWORD_TRIES) {
+                    view.println("비밀번호를 여러 번 틀려 취소했습니다.");
+                    return;
+                }
+                password = view.prompt("비밀번호 (취소하려면 비워 두세요)> ");
+                if (password.isBlank()) {
+                    view.println("취소했습니다.");
+                    return;
+                }
+            } catch (ApiException e) {
+                view.println("조회 실패: " + e.getMessage());
+                return;
+            }
         }
 
         view.showLetter(opened.letter());
         if (opened.replyable() && view.confirm("답장하시겠어요?")) {
-            replyTo(code);
+            replyTo(code, password);
         }
     }
 
     /** 답장 쓰기: 작성자는 따로 적지 않는다. 작성 시각은 서버가 기록하고, 읽는 쪽 화면에 보인다. */
-    private void replyTo(LetterCode original) {
+    private void replyTo(LetterCode original, String password) {
         view.println("답장 내용을 입력하세요. (끝내려면 새 줄에 /end 만 입력)");
         String content = readContent();
         if (content.isBlank()) {
@@ -249,7 +290,7 @@ public class LetterApp {
             return;
         }
 
-        sendWithRetry(() -> api.reply(original, content)).ifPresent(receipt -> {
+        sendWithRetry(() -> api.reply(original, content, password)).ifPresent(receipt -> {
             if (receipt.delivery() == Delivery.SENT) {
                 view.println("\n답장을 보냈습니다! 디스코드로 답장이 왔다고 알려 드렸어요.");
             } else {

@@ -4,7 +4,11 @@ package letter.domain;
 @SuppressWarnings("serial")
 public class LetterException extends RuntimeException {
 
-    public enum Kind { INVALID, NOT_FOUND, TOO_LARGE, RATE_LIMITED, STORAGE_FAILURE, CORRUPTED, UNAVAILABLE }
+    public enum Kind { INVALID, NOT_FOUND, TOO_LARGE, RATE_LIMITED, STORAGE_FAILURE, CORRUPTED, UNAVAILABLE,
+        /** 비밀번호가 걸린 편지인데 비밀번호를 보내지 않았다. */
+        PASSWORD_REQUIRED,
+        /** 비밀번호가 틀렸다. */
+        PASSWORD_WRONG }
 
     private final Kind kind;
 
@@ -23,6 +27,14 @@ public class LetterException extends RuntimeException {
 
     public static LetterException notFound(String message) {
         return new LetterException(Kind.NOT_FOUND, message, null);
+    }
+
+    public static LetterException passwordRequired(String message) {
+        return new LetterException(Kind.PASSWORD_REQUIRED, message, null);
+    }
+
+    public static LetterException passwordWrong(String message) {
+        return new LetterException(Kind.PASSWORD_WRONG, message, null);
     }
 
     public static LetterException tooLarge(String message) {
