@@ -9,19 +9,23 @@ public final class DiscordMessages {
     private DiscordMessages() {
     }
 
-    public static String letterArrived(String author, LetterCode code) {
-        return letterArrived(author, code, null);
+    public static String letterArrived(String sender, LetterCode code) {
+        return letterArrived(sender, code, null);
     }
 
-    /** 비밀번호가 있으면 `|| 비밀번호 ||`(가림 표시)로 함께 알린다. 눌러서 펼쳐 봐야 보인다. */
-    public static String letterArrived(String author, LetterCode code, Password password) {
+    /**
+     * 비밀번호가 있으면 `|| 비밀번호 ||`(가림 표시)로 함께 알린다. 눌러서 펼쳐 봐야 보인다.
+     *
+     * @param sender 보낸 사람 표기. 디스코드 로그인으로 확인된 계정이다. ({이름}(@핸들, ID))
+     */
+    public static String letterArrived(String sender, LetterCode code, Password password) {
         return "💌 편지가 도착했어요!\n"
-                + "보낸 사람: " + codeSpan(author) + "\n"
+                + "보낸 사람: " + codeSpan(sender) + "\n"
                 + "고유 코드: " + codeSpan(code.value()) + "\n"
                 + (password == null ? "" : "비밀번호: || " + codeSpan(password.value()) + " ||\n")
                 + "\n"
                 + "편지 프로그램에서 '편지 확인'을 고르고 위 코드를 입력하면 읽을 수 있어요.\n"
-                + "※ 보낸 사람 이름은 작성자가 직접 정한 이름이라 실제 보낸 사람과 다를 수 있어요."
+                + "※ 보낸 사람은 디스코드 로그인으로 확인된 계정이에요. 편지는 못 받았어도 '받은 편지 목록'에서 코드를 다시 볼 수 있어요."
                 + "\n\n"
                 + "편지 프로그램이 없다면? 다운로드 하세요!" + "\n"
                 + "<https://github.com/xhekr2/Letter>";

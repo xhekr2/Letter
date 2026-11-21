@@ -1,9 +1,13 @@
 package letter.server;
 
 import com.sun.net.httpserver.HttpServer;
-import letter.server.discord.DiscordGateway;
-import letter.server.discord.DiscordRestGateway;
 import letter.server.discord.DisabledDiscordGateway;
+import letter.server.discord.DisabledDiscordOAuth;
+import letter.server.discord.DiscordGateway;
+import letter.server.discord.DiscordOAuth;
+import letter.server.discord.DiscordRestGateway;
+import letter.server.discord.DiscordRestOAuth;
+import letter.server.http.AuthHttpHandler;
 import letter.server.http.DiscordUserHttpHandler;
 import letter.server.http.HttpResponses;
 import letter.server.http.LetterHttpHandler;
@@ -11,6 +15,7 @@ import letter.server.http.RateLimitedHandler;
 import letter.server.http.RateLimiter;
 import letter.server.service.LetterDeliveryService;
 import letter.server.service.LetterService;
+import letter.server.service.LoginService;
 import letter.server.service.RandomCodeGenerator;
 import letter.server.storage.FileLetterRepository;
 import letter.server.storage.LetterRepository;
@@ -32,6 +37,9 @@ import java.util.logging.Logger;
  * 나머지 클래스들은 인터페이스에만 의존한다.
  */
 public class LetterServer {
+    /** 로그인 주소의 분당 요청 한도 = 일반 한도 × 이 값 */
+    private static final int AUTH_LIMIT_FACTOR = 3;
+
     /** 같은 사람에게 디스코드 DM이 몰리지 않도록: 받는 사람 한 명당 10분에 3번까지 */
     private static final int DM_LIMIT_PER_TARGET = 3;
     private static final Duration DM_LIMIT_WINDOW = Duration.ofMinutes(10);
@@ -42,6 +50,7 @@ public class LetterServer {
 
     private final ServerConfig config;
     private final DiscordGateway discordOverride;
+    private final DiscordOAuth oauthOverride;
     private final Logger log = Logger.getLogger(LetterServer.class.getName());
 
     private HttpServer server;
@@ -49,13 +58,19 @@ public class LetterServer {
     private ScheduledExecutorService cleaner;
 
     public LetterServer(ServerConfig config) {
-        this(config, null);
+        this(config, null, null);
     }
 
     /** 디스코드 게이트웨이를 직접 지정한다. (테스트에서 가짜 디스코드를 끼워 넣을 때 쓴다. null이면 설정에 따라 고른다.) */
     public LetterServer(ServerConfig config, DiscordGateway discordOverride) {
+        this(config, discordOverride, null);
+    }
+
+    /** 디스코드 게이트웨이와 로그인(OAuth)을 직접 지정한다. (테스트용. null이면 각각 설정에 따라 고른다.) */
+    public LetterServer(ServerConfig config, DiscordGateway discordOverride, DiscordOAuth oauthOverride) {
         this.config = config;
         this.discordOverride = discordOverride;
+        this.oauthOverride = oauthOverride;
     }
 
     /** 실제로 열린 포트. (설정에서 포트를 0으로 주면 비어 있는 포트가 자동으로 정해진다.) */
@@ -77,12 +92,22 @@ public class LetterServer {
         RateLimiter targetLimiter = new RateLimiter(DM_LIMIT_PER_TARGET, DM_LIMIT_WINDOW, Clock.systemUTC());
         LetterDeliveryService delivery = new LetterDeliveryService(service, discord, targetLimiter);
 
+        DiscordOAuth oauth = oauthOverride != null ? oauthOverride
+                : config.loginEnabled()
+                ? new DiscordRestOAuth(config.discordClientId(), config.discordClientSecret(), config.redirectUri())
+                : new DisabledDiscordOAuth();
+        LoginService login = new LoginService(oauth, Clock.systemUTC(), new SecureRandom());
+        // 로그인 확인은 프로그램이 2초마다 묻는 방식(분당 30회)이라, 편지 요청 한도와 따로 세고 한도도 넉넉히 둔다.
+        // (같은 공유기·프록시 뒤에서 여러 명이 동시에 로그인해도 막히지 않게)
+        RateLimiter authLimiter = new RateLimiter(config.rateLimitPerMinute() * AUTH_LIMIT_FACTOR, Clock.systemUTC());
+
         server = HttpServer.create(new InetSocketAddress(config.port()), 0);
         executor = Executors.newFixedThreadPool(8);
         server.setExecutor(executor);
         server.createContext("/letters",
-                new RateLimitedHandler(new LetterHttpHandler(service, delivery, config.maxBodyBytes()), limiter));
-        server.createContext("/discord", new RateLimitedHandler(new DiscordUserHttpHandler(delivery), limiter));
+                new RateLimitedHandler(new LetterHttpHandler(service, delivery, login, config.maxBodyBytes()), limiter));
+        server.createContext("/discord", new RateLimitedHandler(new DiscordUserHttpHandler(delivery, login), limiter));
+        server.createContext("/auth", new RateLimitedHandler(new AuthHttpHandler(login), authLimiter));
         server.createContext("/health", ex -> HttpResponses.send(ex, 200, "ok"));
         server.createContext("/", ex -> HttpResponses.sendError(ex, 404, "지원하지 않는 주소입니다."));
 
@@ -93,11 +118,20 @@ public class LetterServer {
         });
         cleaner.scheduleAtFixedRate(limiter::evictExpired, 1, 1, TimeUnit.MINUTES);
         cleaner.scheduleAtFixedRate(targetLimiter::evictExpired, 1, 1, TimeUnit.MINUTES);
+        cleaner.scheduleAtFixedRate(authLimiter::evictExpired, 1, 1, TimeUnit.MINUTES);
         cleaner.scheduleAtFixedRate(service::evictExpiredAttempts, 1, 1, TimeUnit.MINUTES);
+        cleaner.scheduleAtFixedRate(login::evictExpired, 1, 1, TimeUnit.MINUTES);
 
         server.start();
         log.info("편지 서버 시작: 포트 " + config.port() + ", 데이터 폴더 " + config.dataDir().toAbsolutePath()
-                + ", 디스코드 전송 " + (discord instanceof DisabledDiscordGateway ? "꺼짐" : "켜짐"));
+                + ", 디스코드 전송 " + (discord instanceof DisabledDiscordGateway ? "꺼짐" : "켜짐")
+                + ", 디스코드 로그인 " + (oauth instanceof DisabledDiscordOAuth ? "꺼짐" : "켜짐"));
+        if (oauth instanceof DisabledDiscordOAuth) {
+            log.warning("디스코드 로그인 설정(DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, PUBLIC_URL)이 없어 아무도 로그인할 수 없고, "
+                    + "편지를 보내거나 읽을 수 없습니다.");
+        } else if (config.loginEnabled()) {
+            log.info("디스코드 개발자 포털의 Redirects에 등록할 주소: " + config.redirectUri());
+        }
     }
 
     public void stop() {

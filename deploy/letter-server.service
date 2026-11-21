@@ -16,6 +16,10 @@ Environment=RATE_LIMIT_PER_MIN=600
 #   sudo mkdir -p /etc/letter
 #   sudo install -m 600 -o root -g root /dev/null /etc/letter/discord.env
 #   sudo nano /etc/letter/discord.env    # 파일 안에 한 줄: DISCORD_BOT_TOKEN=발급받은토큰  (명령줄에 직접 쓰면 터미널 기록에 남는다)
+# 디스코드 로그인(필수): 같은 파일에 아래 세 줄도 넣는다. (없으면 아무도 로그인할 수 없어 편지를 쓰고 읽을 수 없다)
+#   DISCORD_CLIENT_ID=애플리케이션ID
+#   DISCORD_CLIENT_SECRET=클라이언트시크릿
+#   PUBLIC_URL=https://서버주소     (개발자 포털 Redirects에 PUBLIC_URL/auth/callback 등록)
 EnvironmentFile=-/etc/letter/discord.env
 ExecStart=/usr/bin/java -cp /opt/letter letter.server.LetterServer
 Restart=on-failure

@@ -6,10 +6,14 @@ import letter.domain.Letter;
 import letter.domain.LetterCode;
 import letter.domain.LetterDraft;
 import letter.domain.LetterException;
+import letter.domain.LoginPoll;
+import letter.domain.LoginTicket;
 import letter.domain.OpenedLetter;
 import letter.domain.Receipt;
+import letter.protocol.AuthForm;
 import letter.protocol.DiscordForm;
 import letter.protocol.FormCodec;
+import letter.protocol.InboxForm;
 import letter.protocol.LetterForm;
 
 import java.io.IOException;
@@ -24,9 +28,13 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
-/** HTTP로 편지 서버와 통신하는 {@link LetterApi} 구현. */
+/**
+ * HTTP로 편지 서버와 통신하는 {@link LetterApi} 구현.
+ * 로그인을 마치면 서버가 준 세션 토큰을 메모리에만 들고 있다가 모든 요청의 Authorization 헤더에 싣는다. (파일에 저장하지 않는다)
+ */
 public class HttpLetterApi implements LetterApi {
     private static final int MAX_BODY_BYTES = 2_000_000;   // 서버 기본 제한과 동일
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(5);
@@ -34,6 +42,7 @@ public class HttpLetterApi implements LetterApi {
 
     private final HttpClient http;
     private final String baseUrl;
+    private volatile String sessionToken;   // 로그인 전과 로그아웃 뒤에는 null
 
     /** @throws IllegalArgumentException 서버 주소가 올바르지 않을 때 */
     public HttpLetterApi(String url) {
@@ -43,6 +52,60 @@ public class HttpLetterApi implements LetterApi {
 
     public String baseUrl() {
         return baseUrl;
+    }
+
+    @Override
+    public LoginTicket startLogin() throws ApiException {
+        sessionToken = null;   // 새로 로그인하면 이전 로그인은 잊는다
+        Reply reply = call(request("/auth/login").POST(HttpRequest.BodyPublishers.noBody()).build());
+        if (!reply.ok()) throw reply.toException();
+        try {
+            return AuthForm.ticketFromBody(reply.body());
+        } catch (IllegalArgumentException e) {
+            throw unreadable();
+        }
+    }
+
+    @Override
+    public LoginPoll pollLogin(LoginTicket ticket) throws ApiException {
+        String body = FormCodec.encode(Map.of(AuthForm.LOGIN_ID_FIELD, ticket.loginId()));
+        Reply reply = call(request("/auth/poll")
+                .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build());
+        if (!reply.ok()) throw reply.toException();
+
+        LoginPoll poll;
+        try {
+            poll = AuthForm.pollFromBody(reply.body());
+        } catch (IllegalArgumentException e) {
+            throw unreadable();
+        }
+        if (poll.isDone()) sessionToken = poll.token();
+        return poll;
+    }
+
+    @Override
+    public void logout() {
+        String token = sessionToken;
+        sessionToken = null;   // 서버에 닿지 않아도 이쪽은 로그아웃된다
+        if (token == null) return;
+        call(HttpRequest.newBuilder(URI.create(baseUrl + "/auth/logout"))
+                .timeout(Duration.ofSeconds(3))
+                .header("Authorization", "Bearer " + token)
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build());
+    }
+
+    @Override
+    public List<LetterCode> inbox() throws ApiException {
+        Reply reply = call(request("/letters/inbox").GET().build());
+        if (!reply.ok()) throw reply.toException();
+        try {
+            return InboxForm.fromBody(reply.body());
+        } catch (IllegalArgumentException e) {
+            throw unreadable();
+        }
     }
 
     @Override
@@ -71,8 +134,7 @@ public class HttpLetterApi implements LetterApi {
 
     @Override
     public DiscordUser findDiscordUser(DiscordId id) throws ApiException {
-        Reply reply = call(HttpRequest.newBuilder(URI.create(baseUrl + "/discord/users/" + id.value()))
-                .timeout(REQUEST_TIMEOUT).GET().build());
+        Reply reply = call(request("/discord/users/" + id.value()).GET().build());
 
         if (!reply.ok()) throw reply.toException();
         try {
@@ -91,8 +153,7 @@ public class HttpLetterApi implements LetterApi {
         if (body.getBytes(StandardCharsets.UTF_8).length > MAX_BODY_BYTES) {
             throw new ApiException("답장이 너무 깁니다. 조금 줄여서 다시 써 주세요.", false);
         }
-        Reply reply = call(HttpRequest.newBuilder(URI.create(baseUrl + "/letters/" + original.value() + "/replies"))
-                .timeout(REQUEST_TIMEOUT)
+        Reply reply = call(request("/letters/" + original.value() + "/replies")
                 .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build());
@@ -108,10 +169,8 @@ public class HttpLetterApi implements LetterApi {
     @Override
     public OpenedLetter open(LetterCode code, String password) throws ApiException {
         HttpRequest request = password == null
-                ? HttpRequest.newBuilder(URI.create(baseUrl + "/letters/" + code.value()))
-                .timeout(REQUEST_TIMEOUT).GET().build()
-                : HttpRequest.newBuilder(URI.create(baseUrl + "/letters/" + code.value() + "/open"))
-                .timeout(REQUEST_TIMEOUT)
+                ? request("/letters/" + code.value()).GET().build()
+                : request("/letters/" + code.value() + "/open")
                 .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
                 .POST(HttpRequest.BodyPublishers.ofString(
                         FormCodec.encode(Map.of(LetterForm.PASSWORD_FIELD, password))))
@@ -129,7 +188,6 @@ public class HttpLetterApi implements LetterApi {
     /** 편지 발송 요청. discordId가 있으면 서버가 그 사람에게 코드를 디스코드로 전달한다. */
     private Reply postLetter(LetterDraft draft, DiscordId discordId, DiscordId replyTo) throws ApiException {
         Map<String, String> fields = new LinkedHashMap<>();
-        fields.put("author", draft.author());
         fields.put("content", draft.content());
         if (draft.password() != null) fields.put(LetterForm.PASSWORD_FIELD, draft.password().value());
         if (discordId != null) fields.put(DiscordForm.RECIPIENT_FIELD, discordId.value());
@@ -139,11 +197,18 @@ public class HttpLetterApi implements LetterApi {
             throw new ApiException("편지가 너무 깁니다. 조금 줄여서 다시 써 주세요.", false);
         }
 
-        return call(HttpRequest.newBuilder(URI.create(baseUrl + "/letters"))
-                .timeout(REQUEST_TIMEOUT)
+        return call(request("/letters")
                 .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build());
+    }
+
+    /** 주소와 시간 제한을 정하고, 로그인 상태면 세션 토큰을 싣는 요청 틀. */
+    private HttpRequest.Builder request(String path) {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(baseUrl + path)).timeout(REQUEST_TIMEOUT);
+        String token = sessionToken;
+        if (token != null) builder.header("Authorization", "Bearer " + token);
+        return builder;
     }
 
     /** 통신 실패를 예외가 아닌 Reply(status -1 / -2)로 바꿔서 위쪽 코드를 단순하게 만든다. */
@@ -213,6 +278,10 @@ public class HttpLetterApi implements LetterApi {
         }
 
         ApiException toException() {
+            // 401은 "로그인이 필요함"과 "편지 비밀번호가 필요함" 두 가지라서, 서버가 붙인 login=required 표시로 구분한다
+            if (status == 401 && AuthForm.LOGIN_REQUIRED_VALUE.equals(fields.get(AuthForm.LOGIN_REQUIRED_FIELD))) {
+                return new LoginRequiredException(error != null ? error : "로그인이 필요합니다.");
+            }
             if (status == 401 || status == 403) return new PasswordException(error != null ? error : "비밀번호가 필요합니다.", status == 403);
             return new ApiException(error != null ? error : "서버 응답을 이해할 수 없습니다.", retryable());
         }

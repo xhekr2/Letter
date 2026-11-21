@@ -5,6 +5,8 @@ package letter.domain;
 public class LetterException extends RuntimeException {
 
     public enum Kind { INVALID, NOT_FOUND, TOO_LARGE, RATE_LIMITED, STORAGE_FAILURE, CORRUPTED, UNAVAILABLE,
+        /** 로그인하지 않았거나 로그인이 만료되었다. (비밀번호 문제와는 다르다) */
+        UNAUTHENTICATED,
         /** 비밀번호가 걸린 편지인데 비밀번호를 보내지 않았다. */
         PASSWORD_REQUIRED,
         /** 비밀번호가 틀렸다. */
@@ -27,6 +29,10 @@ public class LetterException extends RuntimeException {
 
     public static LetterException notFound(String message) {
         return new LetterException(Kind.NOT_FOUND, message, null);
+    }
+
+    public static LetterException unauthenticated(String message) {
+        return new LetterException(Kind.UNAUTHENTICATED, message, null);
     }
 
     public static LetterException passwordRequired(String message) {
