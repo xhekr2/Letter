@@ -8,17 +8,19 @@ import letter.domain.LetterDraft;
 import letter.domain.LetterException;
 import letter.domain.Password;
 import letter.server.http.RateLimiter;
+import letter.server.storage.LetterEntry;
 import letter.server.storage.LetterRepository;
 
 import java.time.Clock;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.Objects;
 import java.util.regex.Pattern;
 
 /**
- * 편지 발송/조회의 업무 규칙. HTTP도 파일도 모른다.
+ * 편지 발송/조회/받은 편지 목록의 업무 규칙. HTTP도 파일도 모른다.
  * 필요한 부품(저장소, 코드 생성기, 시계)은 생성자로 주입받는다(의존성 주입).
  */
 public class LetterService {
@@ -46,33 +48,30 @@ public class LetterService {
     }
 
     /**
-     * 편지를 저장하고 고유 코드를 돌려준다.
+     * 로그인한 사용자가 쓴 편지를 저장하고 고유 코드를 돌려준다. 편지의 보낸 사람은 항상 {@code sender}이다.
      *
-     * @throws LetterException 작성자 이름이 답장 전용 표기("코드에 대한 답장입니다.")이면 INVALID
+     * @throws LetterException 보낸 사람의 이름이 답장 전용 표기("코드에 대한 답장입니다.")와 같으면 INVALID
      */
-    public LetterCode send(LetterDraft draft) {
-        return send(draft, null);
+    public LetterCode send(DiscordUser sender, LetterDraft draft) {
+        return send(sender, draft, null, null);
     }
 
     /**
-     * 편지를 저장하고 고유 코드를 돌려준다.
+     * 로그인한 사용자가 쓴 편지를 저장하고 고유 코드를 돌려준다.
      *
+     * @param sender  보낸 사람. 로그인으로 확인된 사용자이며, 편지에 "from:"으로 남는다.
      * @param replyTo 답장을 받을 디스코드 ID. 답장을 받지 않으면 null.
+     * @param to      디스코드로 전달하는 편지의 받는 사람. 읽는 사람에게 "to:"로 보이고, 그 사람의 "받은 편지 목록"에 올라간다.
+     *                (디스코드로 보내지 않으면 null)
      */
-    public LetterCode send(LetterDraft draft, DiscordId replyTo) {
-        return send(draft, replyTo, null);
-    }
-
-    /**
-     * 편지를 저장하고 고유 코드를 돌려준다.
-     *
-     * @param to 디스코드로 전달하는 편지의 받는 사람. 읽는 사람에게 "to:"로 보인다. (디스코드로 보내지 않으면 null)
-     */
-    public LetterCode send(LetterDraft draft, DiscordId replyTo, DiscordUser to) {
-        if (RESERVED_AUTHOR.matcher(draft.author()).matches()) {
-            throw LetterException.invalid("이 작성자 이름은 답장 편지 전용이라 사용할 수 없습니다.");
+    public LetterCode send(DiscordUser sender, LetterDraft draft, DiscordId replyTo, DiscordUser to) {
+        Objects.requireNonNull(sender, "sender");
+        String author = sender.authorName();
+        if (RESERVED_AUTHOR.matcher(author).matches()) {
+            // 읽는 사람 화면에는 이름 대신 {이름}(@핸들, ID)가 나오지만, DM과 옛 프로그램에서는 이름만 보이므로 막아 둔다
+            throw LetterException.invalid("디스코드 표시 이름이 답장 편지 전용 표기와 같아 편지를 보낼 수 없습니다. 이름을 바꾼 뒤 다시 시도해 주세요.");
         }
-        return store(draft, replyTo, to);
+        return store(author, sender, draft, replyTo, to, null);
     }
 
     /**
@@ -94,23 +93,31 @@ public class LetterService {
     }
 
     /**
-     * 답장 편지의 초안. 작성자는 "{원본코드}에 대한 답장입니다."로 고정된다.
+     * 답장 편지를 새 고유 코드로 저장한다. 작성자는 "{원본코드}에 대한 답장입니다."로 고정되고,
+     * 답장에는 답장받을 ID가 없으므로 다시 답장할 수 없다.
      *
-     * @throws LetterException 내용이 비었으면 INVALID
+     * @param deliveredTo 답장 코드를 전달할 디스코드 ID. 그 사람의 "받은 편지 목록"에 올라간다.
      */
-    public LetterDraft replyDraft(LetterCode original, String content) {
-        return new LetterDraft(original.value() + REPLY_AUTHOR_SUFFIX, content);
+    public LetterCode saveReply(LetterCode original, LetterDraft reply, DiscordId deliveredTo) {
+        return store(original.value() + REPLY_AUTHOR_SUFFIX, null, reply, null, null, deliveredTo);
     }
 
-    /** 답장 편지를 새 고유 코드로 저장한다. 답장에는 답장받을 ID가 없으므로 다시 답장할 수 없다. */
-    public LetterCode saveReply(LetterDraft replyDraft) {
-        return store(replyDraft, null, null);
+    /**
+     * 해당 사용자에게 전달된 편지의 코드를 최신순(작성 시각이 늦은 것부터)으로 돌려준다.
+     * 디스코드로 받은 편지와 답장 편지가 모두 들어 있고, 편지 내용은 읽지 않는다.
+     */
+    public List<LetterCode> inboxOf(DiscordId owner) {
+        return repository.findByAddressee(owner).stream()
+                .sorted(LetterEntry.NEWEST_FIRST)
+                .map(LetterEntry::code)
+                .toList();
     }
 
-    private LetterCode store(LetterDraft draft, DiscordId replyTo, DiscordUser to) {
+    private LetterCode store(String author, DiscordUser from, LetterDraft draft, DiscordId replyTo, DiscordUser to,
+                             DiscordId deliveredTo) {
         String passwordHash = draft.password() == null ? null : PasswordHasher.hash(draft.password());
-        Letter letter = new Letter(draft.author(), draft.content(),
-                LocalDateTime.now(clock).truncatedTo(ChronoUnit.MINUTES), replyTo, to, passwordHash);
+        Letter letter = new Letter(author, draft.content(),
+                LocalDateTime.now(clock).truncatedTo(ChronoUnit.MINUTES), replyTo, to, passwordHash, from, deliveredTo);
 
         for (int attempt = 0; attempt < MAX_CODE_ATTEMPTS; attempt++) {
             LetterCode code = codeGenerator.next();

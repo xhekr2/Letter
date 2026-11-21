@@ -49,26 +49,28 @@ public class LetterDeliveryService {
     /**
      * 편지를 저장하고 코드를 상대에게 DM으로 보낸다.
      * 디스코드 전달에 실패해도 편지는 이미 저장된 상태이므로 예외 대신 {@link Delivery#FAILED}로 알려 준다.
+     * (이때도 편지는 받는 사람의 "받은 편지 목록"에 올라가 있다.)
      *
      * @throws LetterException 같은 사람에게 너무 자주 보내면 RATE_LIMITED (이때는 편지도 저장하지 않는다)
      */
-    public Receipt sendTo(LetterDraft draft, DiscordId to) {
-        return sendTo(draft, to, null);
+    public Receipt sendTo(DiscordUser sender, LetterDraft draft, DiscordId to) {
+        return sendTo(sender, draft, to, null);
     }
 
     /**
      * 편지를 저장하고 코드를 상대에게 DM으로 보낸다. replyTo가 있으면 그 사람이 이 편지의 답장을 받게 된다.
      *
+     * @param sender  보낸 사람. 로그인으로 확인된 사용자라서 DM에도 확인된 계정으로 적힌다.
      * @param replyTo 답장을 받을 디스코드 ID (답장을 받지 않으면 null)
      * @throws LetterException 같은 사람에게 너무 자주 보내면 RATE_LIMITED (이때는 편지도 저장하지 않는다)
      */
-    public Receipt sendTo(LetterDraft draft, DiscordId to, DiscordId replyTo) {
+    public Receipt sendTo(DiscordUser sender, LetterDraft draft, DiscordId to, DiscordId replyTo) {
         if (!targetLimiter.tryAcquire(to.value())) {
             throw LetterException.rateLimited("해당 사용자에게 너무 자주 보내고 있습니다. 잠시 후 다시 시도해 주세요.");
         }
 
-        LetterCode code = letters.send(draft, replyTo, recipientOf(to));
-        return deliver(to, code, DiscordMessages.letterArrived(draft.author(), code, draft.password()));
+        LetterCode code = letters.send(sender, draft, replyTo, recipientOf(to));
+        return deliver(to, code, DiscordMessages.letterArrived(sender.label(), code, draft.password()));
     }
 
     /**
@@ -85,12 +87,12 @@ public class LetterDeliveryService {
     /** 비밀번호가 걸린 원본이면 password가 맞아야 한다. */
     public Receipt reply(LetterCode original, String content, String password) {
         DiscordId target = letters.replyTargetOf(original, password);
-        LetterDraft draft = letters.replyDraft(original, content);
+        LetterDraft draft = new LetterDraft(content);
         if (!targetLimiter.tryAcquire(target.value())) {
             throw LetterException.rateLimited("이 편지에는 지금 답장을 보낼 수 없습니다. 잠시 후 다시 시도해 주세요.");
         }
 
-        LetterCode code = letters.saveReply(draft);
+        LetterCode code = letters.saveReply(original, draft, target);
         return deliver(target, code, DiscordMessages.replyArrived(original, code));
     }
 

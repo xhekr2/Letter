@@ -1,13 +1,19 @@
 package letter.client;
 
 import letter.domain.Letter;
+import letter.domain.LetterCode;
 
+import java.awt.Desktop;
+import java.awt.GraphicsEnvironment;
 import java.io.Console;
 import java.io.InputStream;
 import java.io.PrintStream;
+import java.net.URI;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Scanner;
+import java.util.function.Consumer;
 
 /** 콘솔 입출력만 담당한다. 서버 통신이나 편지 규칙은 모른다. */
 public class ConsoleView {
@@ -19,17 +25,42 @@ public class ConsoleView {
 
     private final Scanner in;
     private final PrintStream out;
+    private final Consumer<String> browserOpener;
 
+    /** 브라우저를 열지 않는 화면. (테스트와 파이프 입력용) */
     public ConsoleView(InputStream input, Charset charset, PrintStream out) {
+        this(input, charset, out, url -> { });
+    }
+
+    /** @param browserOpener 주소를 브라우저로 여는 방법. 열지 못해도 예외를 던지지 말아야 한다. */
+    public ConsoleView(InputStream input, Charset charset, PrintStream out, Consumer<String> browserOpener) {
         this.in = new Scanner(input, charset);
         this.out = out;
+        this.browserOpener = browserOpener;
     }
 
     /** 실제 콘솔(System.in/out)에 연결된 화면. 윈도우 콘솔의 문자 인코딩에 맞춰 읽는다. */
     public static ConsoleView system() {
         Console console = System.console();
         Charset charset = console != null ? console.charset() : StandardCharsets.UTF_8;
-        return new ConsoleView(System.in, charset, System.out);
+        return new ConsoleView(System.in, charset, System.out, ConsoleView::openInSystemBrowser);
+    }
+
+    /** 이 화면에서 주소를 브라우저로 열어 본다. (열 수 없는 환경이면 조용히 넘어가고, 주소는 화면에 따로 안내한다) */
+    public void openBrowser(String url) {
+        browserOpener.accept(url);
+    }
+
+    private static void openInSystemBrowser(String url) {
+        try {
+            if (GraphicsEnvironment.isHeadless() || !Desktop.isDesktopSupported()
+                    || !Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
+                return;
+            }
+            Desktop.getDesktop().browse(URI.create(url));
+        } catch (Exception | LinkageError ignored) {
+            // 브라우저를 못 열어도 사용자가 주소를 직접 열면 된다
+        }
     }
 
     public void println(String text) {
@@ -56,17 +87,31 @@ public class ConsoleView {
         println("1. 편지 쓰기");
         println("2. 편지 확인");
         println("3. 디스코드로 편지 전송하기");
-        println("4. 종료");
+        println("4. 받은 편지 목록");
+        println("5. 종료");
     }
 
     public void showLetter(Letter letter) {
         println("\n--------------------------------");
-        println("from: " + sanitize(letter.author()));
+        println("from: " + sanitize(letter.fromLabel()));   // 로그인으로 확인된 보낸 사람이 있으면 {이름}(@핸들, ID)
         if (letter.to() != null) println("to: " + sanitize(letter.to().label()));   // 디스코드로 전달된 편지만
         println("작성 시각: " + letter.createdAt().toString().replace('T', ' '));
         println("--------------------------------");
         println(sanitize(letter.content()));
         println("--------------------------------");
+    }
+
+    /** 받은 편지의 코드를 (이미 최신순으로 정렬되어 온 그대로) 한 줄에 하나씩 보여 준다. 코드 외의 정보는 보여 주지 않는다. */
+    public void showInbox(List<LetterCode> codes) {
+        if (codes.isEmpty()) {
+            println("\n받은 편지가 없습니다.");
+            return;
+        }
+        println("\n받은 편지 " + codes.size() + "통 (최신순)");
+        println("--------------------------------");
+        for (LetterCode code : codes) println(code.value());
+        println("--------------------------------");
+        println("편지 내용은 메뉴의 '편지 확인'에서 코드를 입력해 읽을 수 있어요.");
     }
 
     /** 다른 사람이 쓴 편지에 터미널 제어 문자(이스케이프 시퀀스 등)가 있어도 화면이 조작되지 않게 제거한다. */

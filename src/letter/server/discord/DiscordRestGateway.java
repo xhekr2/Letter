@@ -50,15 +50,7 @@ public class DiscordRestGateway implements DiscordGateway {
         requireSuccess(res);
 
         Map<String, Object> user = asObject(res.body());
-        String username = text(user, "username");
-        String globalName = text(user, "global_name");
-        String display;
-        if (globalName != null && !globalName.isBlank()) {
-            display = username == null ? globalName : globalName + " (@" + username + ")";
-        } else {
-            display = username == null ? null : "@" + username;
-        }
-        return Optional.of(new DiscordUser(id, display));
+        return Optional.of(new DiscordUser(id, DiscordNames.display(text(user, "username"), text(user, "global_name"))));
     }
 
     @Override

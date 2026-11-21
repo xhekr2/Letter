@@ -13,9 +13,9 @@ import java.util.Map;
 
 /**
  * {@link Letter} 와 저장/전송 형식의 변환.
- * 저장 형식({@link #toStoredBody})에는 답장받을 사람의 ID와 비밀번호 해시가 들어가고,
+ * 저장 형식({@link #toStoredBody})에는 답장받을 사람의 ID, 전달 대상 ID, 비밀번호 해시가 들어가고,
  * 전송 형식({@link #toBody})에는 들어가지 않는다. (읽는 사람에게 노출되지 않도록 서로 분리)
- * 받는 사람(to)은 읽는 사람에게 보여 주는 정보이므로 두 형식 모두에 들어간다.
+ * 보낸 사람(from)과 받는 사람(to)은 읽는 사람에게 보여 주는 정보이므로 두 형식 모두에 들어간다.
  */
 public final class LetterForm {
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm");
@@ -23,6 +23,9 @@ public final class LetterForm {
     private static final String REPLYABLE = "replyable";
     private static final String TO_ID = "toId";
     private static final String TO_NAME = "toName";
+    private static final String FROM_ID = "fromId";
+    private static final String FROM_NAME = "fromName";
+    private static final String DELIVERED_TO = "deliveredTo";
     private static final String PASSWORD_HASH = "pw";
     /** 편지 발송 요청과 비밀번호 확인 요청에서 비밀번호를 보낼 때 쓰는 항목 이름 */
     public static final String PASSWORD_FIELD = "password";
@@ -30,10 +33,11 @@ public final class LetterForm {
     private LetterForm() {
     }
 
-    /** 파일에 저장하는 형식. 답장받을 ID와 비밀번호 해시가 있으면 포함한다. */
+    /** 파일에 저장하는 형식. 답장받을 ID, 전달 대상 ID, 비밀번호 해시가 있으면 포함한다. */
     public static String toStoredBody(Letter letter) {
         Map<String, String> fields = baseFields(letter);
         if (letter.replyTo() != null) fields.put(REPLY_TO, letter.replyTo().value());
+        if (letter.deliveredTo() != null) fields.put(DELIVERED_TO, letter.deliveredTo().value());
         if (letter.passwordHash() != null) fields.put(PASSWORD_HASH, letter.passwordHash());
         return FormCodec.encode(fields);
     }
@@ -50,6 +54,10 @@ public final class LetterForm {
         fields.put("author", letter.author());
         fields.put("content", letter.content());
         fields.put("createdAt", TIME.format(letter.createdAt()));
+        if (letter.from() != null) {
+            fields.put(FROM_ID, letter.from().id().value());
+            fields.put(FROM_NAME, letter.from().name());
+        }
         if (letter.to() != null) {
             fields.put(TO_ID, letter.to().id().value());
             fields.put(TO_NAME, letter.to().name());
@@ -57,7 +65,7 @@ public final class LetterForm {
         return fields;
     }
 
-    /** 저장 형식과 전송 형식 모두 읽는다. 옛 데이터(replyTo 없음)도 그대로 읽힌다. */
+    /** 저장 형식과 전송 형식 모두 읽는다. 옛 데이터(replyTo, from, deliveredTo 없음)도 그대로 읽힌다. */
     public static Letter fromBody(String body) {
         try {
             Map<String, String> fields = FormCodec.decode(body);
@@ -68,10 +76,14 @@ public final class LetterForm {
             }
             String replyTo = fields.get(REPLY_TO);
             String toId = fields.get(TO_ID);
+            String fromId = fields.get(FROM_ID);
+            String deliveredTo = fields.get(DELIVERED_TO);
             return new Letter(fields.get("author"), content, LocalDateTime.parse(createdAt, TIME),
                     replyTo == null ? null : DiscordId.of(replyTo),
                     toId == null ? null : new DiscordUser(DiscordId.of(toId), fields.get(TO_NAME)),
-                    fields.get(PASSWORD_HASH));
+                    fields.get(PASSWORD_HASH),
+                    fromId == null ? null : new DiscordUser(DiscordId.of(fromId), fields.get(FROM_NAME)),
+                    deliveredTo == null ? null : DiscordId.of(deliveredTo));
         } catch (DateTimeException | LetterException e) {
             throw new IllegalArgumentException("편지 데이터 형식이 올바르지 않습니다.", e);
         }
