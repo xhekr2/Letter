@@ -30,6 +30,18 @@ public record DiscordUser(DiscordId id, String name) {
     }
 
     /**
+     * 화면과 DM에서 짧게 보여 주는 표기: {이름}({@핸들}). ID는 뺀다.
+     * 이름을 알 수 없으면 ID만, 핸들만 있으면 핸들을 이름 자리에도 쓴다.
+     */
+    public String shortLabel() {
+        if (name.equals(UNKNOWN_NAME)) return id.value();
+        Matcher m = NAME_AND_HANDLE.matcher(name);
+        if (m.matches()) return m.group(1) + "(" + m.group(2) + ")";
+        if (name.startsWith("@")) return name.substring(1) + "(" + name + ")";
+        return name;
+    }
+
+    /**
      * 편지의 작성자 표시 이름으로 쓰는 짧은 이름: 핸들을 뺀 이름을 {@link Letter#MAX_AUTHOR_CHARS}자까지만.
      * 이름을 알 수 없으면 "익명".
      */

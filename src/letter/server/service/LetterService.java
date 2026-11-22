@@ -17,7 +17,6 @@ import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Objects;
-import java.util.regex.Pattern;
 
 /**
  * 편지 발송/조회/받은 편지 목록의 업무 규칙. HTTP도 파일도 모른다.
@@ -25,9 +24,6 @@ import java.util.regex.Pattern;
  */
 public class LetterService {
     private static final int MAX_CODE_ATTEMPTS = 10;
-    private static final String REPLY_AUTHOR_SUFFIX = "에 대한 답장입니다.";
-    /** 답장 편지에만 붙는 작성자 표기. 일반 편지가 이 이름을 쓰면 답장인 척 할 수 있어 막는다. */
-    private static final Pattern RESERVED_AUTHOR = Pattern.compile("[A-Za-z2-9]{8}" + Pattern.quote(REPLY_AUTHOR_SUFFIX));
 
     private final LetterRepository repository;
     private final CodeGenerator codeGenerator;
@@ -67,7 +63,7 @@ public class LetterService {
     public LetterCode send(DiscordUser sender, LetterDraft draft, DiscordId replyTo, DiscordUser to) {
         Objects.requireNonNull(sender, "sender");
         String author = sender.authorName();
-        if (RESERVED_AUTHOR.matcher(author).matches()) {
+        if (Letter.isReplyAuthor(author)) {
             // 읽는 사람 화면에는 이름 대신 {이름}(@핸들, ID)가 나오지만, DM과 옛 프로그램에서는 이름만 보이므로 막아 둔다
             throw LetterException.invalid("디스코드 표시 이름이 답장 편지 전용 표기와 같아 편지를 보낼 수 없습니다. 이름을 바꾼 뒤 다시 시도해 주세요.");
         }
@@ -94,12 +90,15 @@ public class LetterService {
 
     /**
      * 답장 편지를 새 고유 코드로 저장한다. 작성자는 "{원본코드}에 대한 답장입니다."로 고정되고,
+     * 답장한 사람은 확인된 보낸 사람(from)으로 남아 읽을 때 "{이름}님이 {원본코드}편지에 답장했어요!"로 보인다.
      * 답장에는 답장받을 ID가 없으므로 다시 답장할 수 없다.
      *
+     * @param replier     답장한 사람. 로그인으로 확인된 사용자다.
      * @param deliveredTo 답장 코드를 전달할 디스코드 ID. 그 사람의 "받은 편지 목록"에 올라간다.
      */
-    public LetterCode saveReply(LetterCode original, LetterDraft reply, DiscordId deliveredTo) {
-        return store(original.value() + REPLY_AUTHOR_SUFFIX, null, reply, null, null, deliveredTo);
+    public LetterCode saveReply(DiscordUser replier, LetterCode original, LetterDraft reply, DiscordId deliveredTo) {
+        Objects.requireNonNull(replier, "replier");
+        return store(Letter.replyAuthor(original), replier, reply, null, null, deliveredTo);
     }
 
     /**
