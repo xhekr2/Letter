@@ -78,7 +78,7 @@ public class LetterHttpHandler implements HttpHandler {
                 HttpResponses.sendError(ex, 405, "이 주소는 POST만 지원합니다.");
                 return;
             }
-            reply(ex, path.substring(ITEM_PREFIX.length(), path.length() - REPLIES_SUFFIX.length()));
+            reply(ex, caller, path.substring(ITEM_PREFIX.length(), path.length() - REPLIES_SUFFIX.length()));
         } else if (path.startsWith(ITEM_PREFIX) && path.endsWith(OPEN_SUFFIX)) {
             if (!method.equals("POST")) {
                 HttpResponses.sendError(ex, 405, "이 주소는 POST만 지원합니다.");
@@ -135,10 +135,10 @@ public class LetterHttpHandler implements HttpHandler {
         HttpResponses.send(ex, 200, LetterForm.toBody(letter));
     }
 
-    private void reply(HttpExchange ex, String rawCode) {
+    private void reply(HttpExchange ex, DiscordUser caller, String rawCode) {
         Map<String, String> form = HttpRequests.readForm(ex, maxBodyBytes);
         String content = form.get("content");
-        Receipt receipt = delivery.reply(LetterCode.of(rawCode), content, form.get(LetterForm.PASSWORD_FIELD));
+        Receipt receipt = delivery.reply(caller, LetterCode.of(rawCode), content, form.get(LetterForm.PASSWORD_FIELD));
         HttpResponses.send(ex, 200, DiscordForm.receiptToBody(receipt));
     }
 }

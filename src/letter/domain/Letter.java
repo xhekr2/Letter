@@ -2,6 +2,8 @@ package letter.domain;
 
 import java.time.LocalDateTime;
 import java.util.Objects;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 발송되어 저장된 편지. 내용 규칙은 {@link LetterDraft}를 재사용해 한 곳에서만 관리한다.
@@ -12,7 +14,7 @@ import java.util.Objects;
  * @param to           디스코드로 전달된 편지의 받는 사람. 디스코드로 보내지 않았으면 null.
  *                     읽는 사람에게 "to:"로 보여 주는 정보다.
  * @param passwordHash 비밀번호의 해시. 비밀번호가 없으면 null. 서버 안에서만 쓰이며 읽는 사람에게는 전달하지 않는다.
- * @param from         디스코드 로그인으로 확인된 보낸 사람. 옛 편지와 답장 편지는 null.
+ * @param from         디스코드 로그인으로 확인된 보낸 사람. 로그인 도입 전의 옛 편지는 null. 답장 편지에서는 답장한 사람이다.
  *                     읽는 사람에게 "from:"으로 보여 주는 정보다.
  * @param deliveredTo  이 편지의 코드가 디스코드로 전달된 사용자의 ID. "받은 편지 목록"에 쓰인다.
  *                     답장 편지는 {@code to}를 숨기므로 따로 기록한다. 서버 안에서만 쓰이며 읽는 사람에게는 전달하지 않는다.
@@ -23,6 +25,9 @@ public record Letter(String author, String content, LocalDateTime createdAt,
                      DiscordUser from, DiscordId deliveredTo) {
     public static final int MAX_AUTHOR_CHARS = 50;
     public static final String ANONYMOUS = "익명";
+    /** 답장 편지에만 붙는 작성자 표기의 꼬리. 일반 편지가 이 형식의 이름을 쓰면 답장인 척 할 수 있어 서버가 막는다. */
+    public static final String REPLY_AUTHOR_SUFFIX = "에 대한 답장입니다.";
+    private static final Pattern REPLY_AUTHOR = Pattern.compile("([A-Za-z2-9]{8})" + Pattern.quote(REPLY_AUTHOR_SUFFIX));
 
     public Letter {
         Objects.requireNonNull(createdAt, "createdAt");
@@ -63,9 +68,26 @@ public record Letter(String author, String content, LocalDateTime createdAt,
         return passwordHash != null;
     }
 
-    /** 읽는 사람에게 "from:"으로 보여 줄 표기. 확인된 보낸 사람이 있으면 {이름}({@핸들}, {ID}), 없으면 작성자 이름. */
+    /** 답장 편지의 작성자 표기: "{원본코드}에 대한 답장입니다." */
+    public static String replyAuthor(LetterCode original) {
+        return original.value() + REPLY_AUTHOR_SUFFIX;
+    }
+
+    /** 이 작성자 이름이 답장 편지 전용 표기 형식인지. (대소문자 구분 없이 본다) */
+    public static boolean isReplyAuthor(String author) {
+        return REPLY_AUTHOR.matcher(author).matches();
+    }
+
+    /**
+     * 읽는 사람에게 "from:"으로 보여 줄 표기.
+     * 답장 편지(답장한 사람이 확인된 경우)는 "{이름}({@핸들})님이 {원본코드}편지에 답장했어요!",
+     * 일반 편지에 확인된 보낸 사람이 있으면 {이름}({@핸들}, {ID}), 없으면 작성자 이름.
+     */
     public String fromLabel() {
-        return from != null ? from.label() : author;
+        if (from == null) return author;
+        Matcher m = REPLY_AUTHOR.matcher(author);
+        if (m.matches()) return from.shortLabel() + "님이 " + m.group(1) + "편지에 답장했어요!";
+        return from.label();
     }
 
     /**

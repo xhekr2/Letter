@@ -219,7 +219,7 @@ public class LetterApp {
 
     /**
      * 디스코드로 편지 전송하기: 작성(편지 쓰기와 동일) → 발송 확인 → 받는 사람의 디스코드 ID 입력
-     * → 그 사람이 맞는지 확인 → 답장 수신 여부(답장을 받을 디스코드 ID, 같은 확인 절차) → 발송. 디스코드 봇이 받는 사람에게 편지 코드만 전달한다.
+     * → 그 사람이 맞는지 확인 → 발송. 답장은 로그인한 내 계정으로 받는다. 디스코드 봇이 받는 사람에게 편지 코드만 전달한다.
      */
     private void writeToDiscord() {
         LetterDraft draft = compose();
@@ -236,10 +236,9 @@ public class LetterApp {
             return;
         }
 
-        DiscordUser replyTo = askReplyTarget();   // null이면 답장을 받지 않는다
-
-        DiscordId replyToId = replyTo == null ? null : replyTo.id();
-        sendWithRetry(() -> authed(() -> api.sendToDiscord(draft, recipient.id(), replyToId)))
+        // 답장은 로그인한 내 계정으로 받는다. 따로 묻지 않는다.
+        DiscordUser replyTo = me;
+        sendWithRetry(() -> authed(() -> api.sendToDiscord(draft, recipient.id(), replyTo.id())))
                 .ifPresent(receipt -> reportDelivery(recipient, replyTo, draft.password() != null, receipt));
     }
 
@@ -297,18 +296,6 @@ public class LetterApp {
         return askDiscordUser("디스코드 ID> ", "받는 사람", "이 사람에게 보내는 게 맞나요?");
     }
 
-    /**
-     * 답장 수신 여부: 답장을 받을 디스코드 ID를 입력받는다. 받는 사람과 같은 조회·확인 절차를 거친다.
-     * 비워 두면 답장을 받지 않는다(null). (답장이 꼭 온다는 보장은 없다)
-     */
-    private DiscordUser askReplyTarget() {
-        view.println("\n답장을 받으시겠어요? 답장을 받을 디스코드 ID(숫자)를 입력하세요. (답장을 받지 않으려면 비워 두세요)");
-        view.println("  받는 사람이 원하면 이 ID로 답장 코드가 전달됩니다. 답장이 꼭 오는 것은 아니에요.");
-        DiscordUser user = askDiscordUser("답장 수신 여부(디스코드 ID)> ", "답장 받을 사용자", "이 사용자가 맞나요?");
-        if (user == null) view.println("답장을 받지 않고 보냅니다.");
-        return user;
-    }
-
     /** 디스코드 ID 입력 → 서버 조회 → 이름 확인의 공통 절차. 비워 두면 null. */
     private DiscordUser askDiscordUser(String promptText, String roleLabel, String confirmQuestion) {
         while (true) {
@@ -351,17 +338,14 @@ public class LetterApp {
     private void reportDelivery(DiscordUser recipient, DiscordUser replyTo, boolean hasPassword, Receipt receipt) {
         view.println("\n편지를 발송했습니다!");
         if (receipt.delivery() == Delivery.SENT) {
-            view.println(ConsoleView.sanitize(recipient.name()) + " 님에게 디스코드로 고유 코드를 전달했어요.");
-            if (hasPassword) view.println("비밀번호는 가려진 상태(|| ||)로 함께 전달했어요.");
+            view.println(ConsoleView.sanitize(recipient.shortLabel()) + " 님에게 디스코드로 고유 코드를 전달했어요.");
         } else {
             view.println("다만 디스코드로 코드를 전달하지 못했어요.");
             view.println("(상대가 편지 봇과 같은 서버에 있는지, 서버 멤버의 DM 수신을 허용했는지 확인해 주세요)");
             view.println(hasPassword ? "아래 고유 코드와 설정한 비밀번호를 상대에게 직접 전달해 주세요."
                     : "아래 고유 코드를 상대에게 직접 전달해 주세요.");
         }
-        if (replyTo != null) {
-            view.println("답장을 받을 사용자: " + ConsoleView.sanitize(replyTo.name()) + " (답장이 올지는 받는 사람에게 달려 있어요)");
-        }
+        view.println("답장을 받을 사용자: " + ConsoleView.sanitize(replyTo.shortLabel()));
         view.println("고유 코드: " + receipt.code());
     }
 

@@ -70,30 +70,32 @@ public class LetterDeliveryService {
         }
 
         LetterCode code = letters.send(sender, draft, replyTo, recipientOf(to));
-        return deliver(to, code, DiscordMessages.letterArrived(sender.label(), code, draft.password()));
+        return deliver(to, code, DiscordMessages.letterArrived(sender.shortLabel(), code, draft.password()));
     }
 
     /**
      * 원본 편지에 대한 답장을 새 편지로 저장하고, 새 코드를 원본에 저장된 디스코드 ID로 DM 보낸다.
-     * 답장하는 사람은 받는 사람이 누구인지 알 수 없다.
+     * DM에는 답장한 사람(로그인으로 확인된 계정)이 적힌다. 답장 편지에도 답장한 사람이 확인된 보낸 사람(from)으로 남는다.
      *
+     * @param replier 답장하는 사람. 로그인으로 확인된 사용자다.
      * @throws LetterException 원본이 없으면 NOT_FOUND, 답장을 받지 않는 편지거나 내용이 비었으면 INVALID,
      *                         답장이 너무 자주 가면 RATE_LIMITED (이때는 저장하지 않는다)
      */
-    public Receipt reply(LetterCode original, String content) {
-        return reply(original, content, null);
+    public Receipt reply(DiscordUser replier, LetterCode original, String content) {
+        return reply(replier, original, content, null);
     }
 
     /** 비밀번호가 걸린 원본이면 password가 맞아야 한다. */
-    public Receipt reply(LetterCode original, String content, String password) {
+    public Receipt reply(DiscordUser replier, LetterCode original, String content, String password) {
+        Objects.requireNonNull(replier, "replier");
         DiscordId target = letters.replyTargetOf(original, password);
         LetterDraft draft = new LetterDraft(content);
         if (!targetLimiter.tryAcquire(target.value())) {
             throw LetterException.rateLimited("이 편지에는 지금 답장을 보낼 수 없습니다. 잠시 후 다시 시도해 주세요.");
         }
 
-        LetterCode code = letters.saveReply(original, draft, target);
-        return deliver(target, code, DiscordMessages.replyArrived(original, code));
+        LetterCode code = letters.saveReply(replier, original, draft, target);
+        return deliver(target, code, DiscordMessages.replyArrived(replier.shortLabel(), code));
     }
 
     /**
