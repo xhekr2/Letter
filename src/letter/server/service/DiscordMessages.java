@@ -43,6 +43,18 @@ public final class DiscordMessages {
     }
 
     /**
+     * 로그인 인증 코드 안내. 프로그램에 이 코드를 입력하면 로그인된다.
+     *
+     * @param minutes 코드가 유효한 시간(분)
+     */
+    public static String loginCode(String code, int minutes) {
+        return "🔐 편지 프로그램 로그인 인증 코드: " + codeSpan(code) + "\n"
+                + "편지 프로그램에 이 코드를 입력하면 로그인돼요. (" + minutes + "분 동안만 유효해요)\n"
+                + "\n"
+                + "본인이 요청한 게 아니라면 코드를 알려 주지 말고 이 메시지를 무시해 주세요.";
+    }
+
+    /**
      * 사용자가 입력한 문자열을 디스코드 서식(링크, 멘션, 굵게 등)이 적용되지 않는 코드 조각(`...`)으로 감싼다.
      * 이름에 URL을 넣어 봇의 메시지로 링크를 퍼뜨리는 일을 막기 위해서다.
      */

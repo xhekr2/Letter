@@ -7,7 +7,7 @@ import letter.domain.Letter;
 import letter.domain.LetterCode;
 import letter.domain.LetterDraft;
 import letter.domain.LetterException;
-import letter.domain.LoginPoll;
+import letter.domain.LoginResult;
 import letter.domain.LoginTicket;
 import letter.domain.Password;
 import letter.domain.OpenedLetter;
@@ -20,34 +20,17 @@ import java.util.Optional;
 /**
  * 화면(ConsoleView)과 서버(LetterApi)를 이어 주는 프로그램의 흐름 담당.
  * 두 부품은 생성자로 주입받으므로, 테스트에서는 가짜 구현을 넣을 수 있다.
- * 프로그램을 시작할 때마다 디스코드로 로그인해야 메뉴가 열리고, 로그인 정보는 저장하지 않는다.
+ * 프로그램을 시작할 때마다 로그인해야 메뉴가 열린다. 내 디스코드 ID를 입력하면 봇이 DM으로 인증 코드를 보내 주고,
+ * 그 코드를 이 프로그램에 입력하면 로그인된다. 로그인 정보는 저장하지 않는다.
  */
 public class LetterApp {
-    /** 로그인 확인을 기다리며 서버에 묻는 간격 */
-    static final long POLL_INTERVAL_MILLIS = 2000;
-    /** 통신 오류가 이만큼 연달아 나면 기다리기를 멈추고 사용자에게 다시 할지 묻는다 */
-    private static final int MAX_POLL_FAILURES = 5;
-
-    /** 기다리는 방법. 테스트에서는 실제로 쉬지 않는 구현을 넣는다. */
-    @FunctionalInterface
-    public interface Pause {
-        void pause(long millis) throws InterruptedException;
-    }
-
     private final LetterApi api;
     private final ConsoleView view;
-    private final Pause pause;
     private DiscordUser me;     // 로그인한 사용자. 로그인 전에는 null
 
     public LetterApp(LetterApi api, ConsoleView view) {
-        this(api, view, Thread::sleep);
-    }
-
-    /** @param pause 로그인 승인을 기다리는 동안 쉬는 방법. (테스트에서는 실제로 쉬지 않는 구현을 넣는다) */
-    public LetterApp(LetterApi api, ConsoleView view, Pause pause) {
         this.api = Objects.requireNonNull(api);
         this.view = Objects.requireNonNull(view);
-        this.pause = Objects.requireNonNull(pause);
     }
 
     /** 서버로 보내는 한 번의 동작. 실패하면 ApiException. */
@@ -103,32 +86,31 @@ public class LetterApp {
     // ---------------------------------------------------------------- 로그인
 
     /**
-     * 디스코드 로그인: 승인 주소와 확인 코드를 보여 주고, 사용자가 브라우저에서 승인할 때까지 기다린다.
+     * 디스코드 로그인: 내 디스코드 ID를 입력하면 봇이 DM으로 인증 코드를 보낸다. 그 코드를 입력하면 로그인된다.
      * 실패하거나 시간이 지나면 다시 할지 묻는다.
      *
      * @return 로그인했으면 true, 사용자가 그만두었으면 false
      */
     private boolean login() {
         view.println("\n===== 디스코드 로그인 =====");
-        view.println("편지를 쓰고 받으려면 디스코드 계정으로 로그인해야 해요. (프로그램을 시작할 때마다 로그인합니다)");
+        view.println("편지를 쓰고 받으려면 로그인해야 해요. 내 디스코드 ID를 입력하면 편지 봇이 DM으로 인증 코드를 보내 줘요.");
+        view.println("(프로그램을 시작할 때마다 로그인합니다. 편지 봇이 있는 디스코드 서버에 함께 있어야 해요.)");
         while (true) {
+            DiscordId id = askMyId();
+            if (id == null) return false;
+
             LoginTicket ticket;
             try {
-                ticket = api.startLogin();
+                ticket = api.startLogin(id);
             } catch (ApiException e) {
-                view.println("로그인을 시작하지 못했어요: " + e.getMessage());
+                view.println("인증 코드를 보내지 못했어요: " + e.getMessage());
                 if (!view.confirm("다시 시도할까요?")) return false;
                 continue;
             }
 
-            view.println("\n1) 아래 주소를 브라우저에서 열어 디스코드로 승인해 주세요. (자동으로 열리지 않으면 직접 붙여 넣으세요)");
-            view.println("   " + ticket.url());
-            view.println("2) 승인 후 브라우저 화면에 아래 확인 코드를 입력해 주세요.");
-            view.println("   확인 코드: " + ticket.confirmCode());
-            view.println("   (" + (ticket.expiresInSeconds() / 60) + "분 안에 끝내 주세요. 기다리는 동안 이 창을 닫지 마세요.)");
-            view.openBrowser(ticket.url());
-
-            LoginPoll result = waitForApproval(ticket);
+            view.println("\n디스코드 DM으로 인증 코드를 보냈어요. DM에서 숫자 6자리를 확인해 아래에 입력해 주세요.");
+            view.println("(" + (ticket.expiresInSeconds() / 60) + "분 안에 입력해 주세요. 코드를 못 받았다면 비워 두고 Enter를 누르세요.)");
+            LoginResult result = askCode(ticket);
             if (result != null) {
                 me = result.user();
                 view.println("\n" + ConsoleView.sanitize(me.name()) + " 님으로 로그인했어요.");
@@ -138,36 +120,47 @@ public class LetterApp {
         }
     }
 
-    /** 로그인이 끝날 때까지 서버에 묻는다. 만료·오류로 끝나면 이유를 알리고 null. */
-    private LoginPoll waitForApproval(LoginTicket ticket) {
-        long maxPolls = Math.max(1, ticket.expiresInSeconds() * 1000L / POLL_INTERVAL_MILLIS);
-        int failures = 0;
-        view.println("\n로그인을 기다리는 중...");
-        for (long i = 0; i < maxPolls; i++) {
+    /**
+     * 로그인할 내 디스코드 ID를 입력받는다. 이미 로그인한 적이 있으면(로그인이 만료된 경우) 같은 계정으로 다시 로그인한다.
+     * 비워 두면 그만둔다(null).
+     */
+    private DiscordId askMyId() {
+        if (me != null) {
+            view.println("\n" + ConsoleView.sanitize(me.name()) + " 님 계정으로 다시 로그인해요.");
+            return me.id();
+        }
+        view.println("\n  ID 확인 방법: 디스코드 설정 → 고급 → 개발자 모드 켜기 → 내 프로필 우클릭 → '사용자 ID 복사'");
+        while (true) {
+            String raw = view.prompt("내 디스코드 ID(숫자, 그만두려면 비워 두세요)> ");
+            if (raw.isBlank()) return null;
             try {
-                LoginPoll poll = api.pollLogin(ticket);
-                failures = 0;
-                if (poll.isDone()) return poll;
-            } catch (ApiException e) {
-                if (!e.isRetryable()) {                   // 만료되었거나 요청이 사라짐: 기다려도 소용없다
-                    view.println("로그인에 실패했어요: " + e.getMessage());
-                    return null;
-                }
-                if (++failures >= MAX_POLL_FAILURES) {
-                    view.println("서버와 연결이 계속 끊겨요: " + e.getMessage());
-                    return null;
-                }
-            }
-            try {
-                pause.pause(POLL_INTERVAL_MILLIS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                view.println("로그인 대기를 중단했어요.");
-                return null;
+                return DiscordId.of(raw);   // 규칙은 도메인이 판단한다
+            } catch (LetterException e) {
+                view.println(e.getMessage());
             }
         }
-        view.println("시간이 지나 로그인 요청이 만료되었어요.");
-        return null;
+    }
+
+    /**
+     * DM으로 받은 인증 코드를 입력받아 확인한다. 틀리면 서버가 허용하는 횟수 안에서 다시 입력받는다.
+     * 비워 두거나 만료·오류로 끝나면 이유를 알리고 null.
+     */
+    private LoginResult askCode(LoginTicket ticket) {
+        while (true) {
+            String code = view.prompt("인증 코드> ").trim();
+            if (code.isEmpty()) {
+                view.println("인증을 취소했어요.");
+                return null;
+            }
+            try {
+                return api.verifyLogin(ticket, code);
+            } catch (CodeWrongException e) {
+                view.println(e.getMessage());                 // 틀렸어요. (남은 횟수 N번)
+            } catch (ApiException e) {
+                view.println("로그인에 실패했어요: " + e.getMessage());
+                if (!e.isRetryable()) return null;           // 만료되었거나 취소됨: 같은 코드로는 소용없다
+            }
+        }
     }
 
     /**

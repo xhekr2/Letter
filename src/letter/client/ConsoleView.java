@@ -3,17 +3,13 @@ package letter.client;
 import letter.domain.Letter;
 import letter.domain.LetterCode;
 
-import java.awt.Desktop;
-import java.awt.GraphicsEnvironment;
 import java.io.Console;
 import java.io.InputStream;
 import java.io.PrintStream;
-import java.net.URI;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Scanner;
-import java.util.function.Consumer;
 
 /** 콘솔 입출력만 담당한다. 서버 통신이나 편지 규칙은 모른다. */
 public class ConsoleView {
@@ -25,42 +21,17 @@ public class ConsoleView {
 
     private final Scanner in;
     private final PrintStream out;
-    private final Consumer<String> browserOpener;
 
-    /** 브라우저를 열지 않는 화면. (테스트와 파이프 입력용) */
     public ConsoleView(InputStream input, Charset charset, PrintStream out) {
-        this(input, charset, out, url -> { });
-    }
-
-    /** @param browserOpener 주소를 브라우저로 여는 방법. 열지 못해도 예외를 던지지 말아야 한다. */
-    public ConsoleView(InputStream input, Charset charset, PrintStream out, Consumer<String> browserOpener) {
         this.in = new Scanner(input, charset);
         this.out = out;
-        this.browserOpener = browserOpener;
     }
 
     /** 실제 콘솔(System.in/out)에 연결된 화면. 윈도우 콘솔의 문자 인코딩에 맞춰 읽는다. */
     public static ConsoleView system() {
         Console console = System.console();
         Charset charset = console != null ? console.charset() : StandardCharsets.UTF_8;
-        return new ConsoleView(System.in, charset, System.out, ConsoleView::openInSystemBrowser);
-    }
-
-    /** 이 화면에서 주소를 브라우저로 열어 본다. (열 수 없는 환경이면 조용히 넘어가고, 주소는 화면에 따로 안내한다) */
-    public void openBrowser(String url) {
-        browserOpener.accept(url);
-    }
-
-    private static void openInSystemBrowser(String url) {
-        try {
-            if (GraphicsEnvironment.isHeadless() || !Desktop.isDesktopSupported()
-                    || !Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
-                return;
-            }
-            Desktop.getDesktop().browse(URI.create(url));
-        } catch (Exception | LinkageError ignored) {
-            // 브라우저를 못 열어도 사용자가 주소를 직접 열면 된다
-        }
+        return new ConsoleView(System.in, charset, System.out);
     }
 
     public void println(String text) {

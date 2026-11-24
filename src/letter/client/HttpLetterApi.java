@@ -6,7 +6,7 @@ import letter.domain.Letter;
 import letter.domain.LetterCode;
 import letter.domain.LetterDraft;
 import letter.domain.LetterException;
-import letter.domain.LoginPoll;
+import letter.domain.LoginResult;
 import letter.domain.LoginTicket;
 import letter.domain.OpenedLetter;
 import letter.domain.Receipt;
@@ -55,9 +55,13 @@ public class HttpLetterApi implements LetterApi {
     }
 
     @Override
-    public LoginTicket startLogin() throws ApiException {
+    public LoginTicket startLogin(DiscordId id) throws ApiException {
         sessionToken = null;   // 새로 로그인하면 이전 로그인은 잊는다
-        Reply reply = call(request("/auth/login").POST(HttpRequest.BodyPublishers.noBody()).build());
+        String body = FormCodec.encode(Map.of(AuthForm.DISCORD_ID_FIELD, id.value()));
+        Reply reply = call(request("/auth/login")
+                .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build());
         if (!reply.ok()) throw reply.toException();
         try {
             return AuthForm.ticketFromBody(reply.body());
@@ -67,22 +71,27 @@ public class HttpLetterApi implements LetterApi {
     }
 
     @Override
-    public LoginPoll pollLogin(LoginTicket ticket) throws ApiException {
-        String body = FormCodec.encode(Map.of(AuthForm.LOGIN_ID_FIELD, ticket.loginId()));
-        Reply reply = call(request("/auth/poll")
+    public LoginResult verifyLogin(LoginTicket ticket, String code) throws ApiException {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put(AuthForm.LOGIN_ID_FIELD, ticket.loginId());
+        fields.put(AuthForm.CODE_FIELD, code);
+        Reply reply = call(request("/auth/verify")
                 .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .POST(HttpRequest.BodyPublishers.ofString(FormCodec.encode(fields)))
                 .build());
-        if (!reply.ok()) throw reply.toException();
+        if (reply.status() == 403) {   // 코드만 틀린 경우: 남은 횟수 안에서 다시 입력할 수 있다
+            throw new CodeWrongException(reply.error() != null ? reply.error() : "인증 코드가 맞지 않아요.");
+        }
+        if (!reply.ok()) throw new ApiException(reply.error() != null ? reply.error() : "로그인하지 못했습니다.", reply.retryable());
 
-        LoginPoll poll;
+        LoginResult result;
         try {
-            poll = AuthForm.pollFromBody(reply.body());
+            result = AuthForm.resultFromBody(reply.body());
         } catch (IllegalArgumentException e) {
             throw unreadable();
         }
-        if (poll.isDone()) sessionToken = poll.token();
-        return poll;
+        sessionToken = result.token();
+        return result;
     }
 
     @Override
