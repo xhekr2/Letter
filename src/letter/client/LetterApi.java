@@ -5,7 +5,7 @@ import letter.domain.DiscordUser;
 import letter.domain.Letter;
 import letter.domain.LetterCode;
 import letter.domain.LetterDraft;
-import letter.domain.LoginPoll;
+import letter.domain.LoginResult;
 import letter.domain.LoginTicket;
 import letter.domain.OpenedLetter;
 import letter.domain.Receipt;
@@ -14,19 +14,25 @@ import java.util.List;
 
 /**
  * 편지 서버와 주고받는 기능의 추상화. 화면(LetterApp)은 통신 방식(HTTP 등)을 모른다.
- * 로그인({@link #startLogin}, {@link #pollLogin})을 마치면 이후 모든 요청에 로그인 정보가 함께 실린다.
+ * 로그인({@link #startLogin}, {@link #verifyLogin})을 마치면 이후 모든 요청에 로그인 정보가 함께 실린다.
  */
 public interface LetterApi {
 
-    /** 디스코드 로그인을 시작한다. 사용자가 열 승인 주소와 확인 코드를 받는다. */
-    LoginTicket startLogin() throws ApiException;
+    /**
+     * 디스코드 로그인을 시작한다. 서버가 해당 디스코드 계정으로 인증 코드를 DM으로 보낸다.
+     *
+     * @param id 로그인하려는 내 디스코드 ID
+     */
+    LoginTicket startLogin(DiscordId id) throws ApiException;
 
     /**
-     * 로그인이 끝났는지 서버에 묻는다. 끝났으면 이 API 객체가 로그인 상태가 되어 이후 요청이 모두 그 계정으로 간다.
+     * DM으로 받은 인증 코드를 보낸다. 맞으면 이 API 객체가 로그인 상태가 되어 이후 요청이 모두 그 계정으로 간다.
      *
-     * @throws ApiException 로그인 요청이 만료되었거나 없으면 (다시 로그인해야 한다)
+     * @return 로그인 결과(세션 토큰과 로그인한 디스코드 사용자)
+     * @throws CodeWrongException 코드가 틀렸을 때 (남은 횟수 안에서는 다시 입력할 수 있다)
+     * @throws ApiException       로그인 요청이 만료되었거나 취소되었으면 (다시 로그인해야 한다)
      */
-    LoginPoll pollLogin(LoginTicket ticket) throws ApiException;
+    LoginResult verifyLogin(LoginTicket ticket, String code) throws ApiException;
 
     /** 서버의 로그인 세션을 끝내고 이 API 객체를 로그아웃 상태로 만든다. 서버에 닿지 않아도 이쪽은 로그아웃된다. */
     void logout();

@@ -38,30 +38,6 @@ public final class HttpResponses {
     }
 
     /**
-     * 브라우저에 보여 줄 HTML 응답. 이 서버의 화면은 정적인 안내 페이지뿐이라, 스크립트·외부 자원·다른 사이트의 프레임 삽입을
-     * 모두 막는다. (로그인 확인 화면을 다른 페이지 위에 몰래 겹쳐 놓는 클릭 유도를 막기 위해서다)
-     */
-    public static void sendHtml(HttpExchange ex, int status, String html) {
-        var headers = ex.getResponseHeaders();
-        headers.set("Content-Security-Policy",
-                "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
-        headers.set("X-Frame-Options", "DENY");
-        headers.set("X-Content-Type-Options", "nosniff");
-        headers.set("Referrer-Policy", "no-referrer");
-        try {
-            byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
-            headers.set("Content-Type", "text/html; charset=UTF-8");
-            headers.set("Cache-Control", "no-store");
-            ex.sendResponseHeaders(status, bytes.length);
-            ex.getResponseBody().write(bytes);
-        } catch (IOException e) {
-            LOG.warning("응답 전송 실패 (클라이언트 연결 끊김 등): " + e.getMessage());
-        } finally {
-            ex.close();
-        }
-    }
-
-    /**
      * 로그인이 필요하다는 응답(401). 비밀번호가 필요하다는 응답도 같은 401이라, 프로그램이 둘을 구분할 수 있게
      * {@code login=required} 항목을 함께 보낸다.
      */
@@ -101,7 +77,7 @@ public final class HttpResponses {
         return switch (kind) {
             case INVALID -> 400;
             case UNAUTHENTICATED, PASSWORD_REQUIRED -> 401;
-            case PASSWORD_WRONG -> 403;
+            case PASSWORD_WRONG, CODE_WRONG -> 403;
             case NOT_FOUND -> 404;
             case TOO_LARGE -> 413;
             case RATE_LIMITED -> 429;

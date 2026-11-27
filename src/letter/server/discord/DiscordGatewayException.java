@@ -5,12 +5,10 @@ package letter.server.discord;
 public class DiscordGatewayException extends Exception {
 
     public enum Reason {
-        /** 봇 토큰이나 OAuth 설정이 없거나 올바르지 않아 기능을 쓸 수 없다. */
+        /** 봇 토큰이 없거나 올바르지 않아 기능을 쓸 수 없다. */
         NOT_CONFIGURED,
         /** 상대가 DM을 막았거나 봇과 같은 서버에 없어서 보낼 수 없다. */
         DM_NOT_ALLOWED,
-        /** 로그인 승인 코드가 거부되었다. (만료, 이미 사용, 잘못된 값 등) */
-        INVALID_CODE,
         /** 네트워크 오류, 시간 초과, 디스코드 장애, 호출 한도 초과 등 일시적인 문제. */
         UNAVAILABLE
     }

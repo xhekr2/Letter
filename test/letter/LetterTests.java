@@ -1,6 +1,7 @@
 package letter;
 
 import letter.client.ApiException;
+import letter.client.CodeWrongException;
 import letter.client.ConsoleView;
 import letter.client.HttpLetterApi;
 import letter.client.LetterApi;
@@ -15,7 +16,7 @@ import letter.domain.LetterCode;
 import letter.domain.LetterDraft;
 import letter.domain.LetterException;
 import letter.domain.LetterException.Kind;
-import letter.domain.LoginPoll;
+import letter.domain.LoginResult;
 import letter.domain.LoginTicket;
 import letter.domain.OpenedLetter;
 import letter.domain.Password;
@@ -31,9 +32,7 @@ import letter.server.discord.DisabledDiscordGateway;
 import letter.server.discord.DiscordGateway;
 import letter.server.discord.DiscordGatewayException;
 import letter.server.discord.DiscordGatewayException.Reason;
-import letter.server.discord.DiscordOAuth;
 import letter.server.discord.DiscordRestGateway;
-import letter.server.discord.DiscordRestOAuth;
 import letter.server.http.RateLimiter;
 import letter.server.service.CodeGenerator;
 import letter.server.service.DiscordMessages;
@@ -525,7 +524,7 @@ public class LetterTests {
             withServer(discord, (server, api, dir) -> {
                 String out = runApp(api, "3\n안녕\n/end\n\ny\nabc\n홍길동#1234\n\n5\n");
                 has(out, "올바르지 않은 디스코드 ID입니다.");
-                eq(0, discord.lookups);
+                eq(0, discord.letterLookups());
                 eq(0, countLetters(dir));
             });
         });
@@ -539,13 +538,6 @@ public class LetterTests {
                 has(out, "직접 전달해 주세요.");
                 eq("안녕하세요\n두번째 줄", api.read(LetterCode.of(codeIn(out))).content());
                 eq(0, discord.dms.size());
-            });
-        });
-        test("[E2E] 디스코드 설정이 없는 서버(봇 토큰 없음)는 안내하고 편지를 보내지 않음", () -> {
-            withServer(null, (server, api, dir) -> {                                // 토큰도 가짜도 없음 = 기능 꺼짐
-                String out = runApp(api, "3\n안녕\n/end\n\ny\n" + ID_HONG + "\n\n5\n");
-                has(out, "이 서버에서는 디스코드 전송 기능을 사용할 수 없습니다.");
-                eq(0, countLetters(dir));
             });
         });
         test("[E2E] 같은 사람에게 연속으로 보내면 4번째부터 제한", () -> {
@@ -1095,39 +1087,69 @@ public class LetterTests {
 
     // ======================================================================== 로그인 / 받은 편지 목록
 
-    private static final String CODE_HONG = "approval-hong";
-    private static final String CODE_KIM = "approval-kim";
     private static final DiscordUser HONG = new DiscordUser(DiscordId.of(ID_HONG), "홍길동 (@gildong)");
     private static final DiscordUser KIM = new DiscordUser(DiscordId.of(ID_KIM), "김철수");
 
-    private static LoginService loginService(FakeOAuth oauth, MutableClock clock) {
-        return new LoginService(oauth, clock, new java.util.Random(7));
+    /** 테스트 서버가 만드는 로그인 인증 코드는 항상 이 값이다. (프로그램에 입력하는 줄을 미리 써 둘 수 있게) */
+    private static final String LOGIN_CODE = "123456";
+
+    /** 인증 코드 자리(6자리 숫자)에 항상 {@link #LOGIN_CODE}를 내주는 난수. */
+    private static class FixedCodeRandom extends java.util.Random {
+        private static final java.util.concurrent.atomic.AtomicInteger SEEDS = new java.util.concurrent.atomic.AtomicInteger();
+
+        FixedCodeRandom() {
+            super(SEEDS.incrementAndGet());   // 서버마다 다른 토큰이 나오게 한다. (서버를 다시 켜도 옛 토큰이 되살아나지 않는지 시험하려면 필요)
+        }
+
+        @Override
+        public int nextInt(int bound) {
+            return bound == 1_000_000 ? Integer.parseInt(LOGIN_CODE) : super.nextInt(bound);
+        }
     }
 
-    private static String stateOf(LoginTicket ticket) {
-        return Pattern.compile("state=([^&]+)").matcher(ticket.url()).results().findFirst().orElseThrow().group(1);
+    private static LoginService loginService(FakeDiscord discord, MutableClock clock) {
+        return new LoginService(discord, clock, new java.util.Random(7), new RateLimiter(3, Duration.ofMinutes(10), clock));
     }
 
-    /** 서비스에서 로그인을 끝까지 진행해 세션 토큰을 받는다. */
-    private static LoginPoll fullLogin(LoginService login, String approvalCode) {
-        LoginTicket ticket = login.start();
-        login.receiveApproval(stateOf(ticket), approvalCode);
-        login.confirm(stateOf(ticket), ticket.confirmCode());
-        return login.poll(ticket.loginId());
+    /** 가장 최근에 그 사용자에게 간 로그인 인증 코드 DM에서 6자리 코드를 꺼낸다. */
+    private static String loginCodeSentTo(FakeDiscord discord, String id) {
+        String code = null;
+        for (String[] dm : discord.loginDms) {
+            if (!dm[0].equals(id)) continue;
+            Matcher m = Pattern.compile("인증 코드: `([0-9]{6})`").matcher(dm[1]);
+            if (!m.find()) throw new AssertionError("DM에 인증 코드가 없음:\n" + dm[1]);
+            code = m.group(1);
+        }
+        if (code == null) throw new AssertionError("그 사용자에게 간 인증 코드 DM이 없음: " + id);
+        return code;
+    }
+
+    /** 서비스에서 로그인을 끝까지 진행한다. (DM으로 간 코드를 그대로 입력) */
+    private static LoginResult fullLogin(LoginService login, FakeDiscord discord, DiscordUser who) {
+        LoginTicket ticket = login.start(who.id());
+        return login.verify(ticket.loginId(), loginCodeSentTo(discord, who.id().value()));
+    }
+
+    /** 로그인할 수 있는 사용자(철수, 홍길동, 김철수)가 있는 가짜 디스코드. */
+    private static FakeDiscord discordWithUsers() {
+        FakeDiscord discord = new FakeDiscord();
+        discord.users.put(ID_HONG, "홍길동 (@gildong)");
+        discord.users.put(ID_KIM, "김철수");
+        return discord;
     }
 
     /** 앱 테스트용 가짜 API. 어떤 응답을 할지 필드로 정한다. */
     private static class StubApi implements LetterApi {
-        int pendingPolls = 0;                 // 이만큼은 "아직"이라고 답한다
-        int pollFailures = 0;                 // 이만큼은 pollFailure를 던진다
-        ApiException pollFailure = null;
+        int wrongCodes = 0;                   // 이만큼은 "코드가 틀렸어요"라고 답한다
+        ApiException verifyFailure = null;    // 한 번 던지고 비운다
         ApiException startFailure = null;     // 한 번 던지고 비운다
         boolean failStartAfterFirstLogin = false;
         int loginRequiredCalls = 0;           // 다음 이만큼의 업무 호출은 "로그인 필요"로 거절한다
         List<LetterCode> inbox = List.of();
         int logins = 0;
         int logouts = 0;
-        int polls = 0;
+        final List<DiscordId> startedFor = new java.util.ArrayList<>();
+        final List<String> codesTried = new java.util.ArrayList<>();
         final List<String> sent = new java.util.ArrayList<>();
 
         private void guard() throws ApiException {
@@ -1138,7 +1160,7 @@ public class LetterTests {
         }
 
         @Override
-        public LoginTicket startLogin() throws ApiException {
+        public LoginTicket startLogin(DiscordId id) throws ApiException {
             if (startFailure != null) {
                 ApiException failure = startFailure;
                 startFailure = null;
@@ -1146,21 +1168,23 @@ public class LetterTests {
             }
             if (failStartAfterFirstLogin && logins >= 1) throw new ApiException("서버에 연결할 수 없습니다.", false);
             logins++;
-            return new LoginTicket("login" + logins, "https://discord.test/auth?state=s" + logins, "ABC-DEF", 600);
+            startedFor.add(id);
+            return new LoginTicket("login" + logins, 300);
         }
 
         @Override
-        public LoginPoll pollLogin(LoginTicket ticket) throws ApiException {
-            polls++;
-            if (pollFailures > 0) {
-                pollFailures--;
-                throw pollFailure;
+        public LoginResult verifyLogin(LoginTicket ticket, String code) throws ApiException {
+            codesTried.add(code);
+            if (wrongCodes > 0) {
+                wrongCodes--;
+                throw new CodeWrongException("인증 코드가 맞지 않아요. (남은 횟수 " + (wrongCodes + 1) + "번)");
             }
-            if (pendingPolls > 0) {
-                pendingPolls--;
-                return LoginPoll.pending();
+            if (verifyFailure != null) {
+                ApiException failure = verifyFailure;
+                verifyFailure = null;
+                throw failure;
             }
-            return new LoginPoll("token" + logins, HONG);
+            return new LoginResult("token" + logins, HONG);
         }
 
         @Override
@@ -1207,18 +1231,22 @@ public class LetterTests {
         }
     }
 
-    /** 가짜 API로 콘솔 앱을 돌린다. 기다리지 않고, 브라우저로 연 주소는 opened에 모은다. */
-    private static String runStub(StubApi api, String script, List<String> opened) {
+    /** 앱 테스트에서 로그인할 때 입력하는 두 줄: 내 디스코드 ID, DM으로 받은 인증 코드. */
+    private static final String STUB_LOGIN = ID_HONG + "\n" + LOGIN_CODE + "\n";
+
+    /** 가짜 API로 콘솔 앱을 돌린다. 로그인 입력(STUB_LOGIN)을 자동으로 앞에 붙인다. */
+    private static String runStub(StubApi api, String script) {
+        return runStubRaw(api, STUB_LOGIN + script);
+    }
+
+    /** 가짜 API로 콘솔 앱을 돌린다. 입력을 그대로 흘려 넣는다. (로그인 과정 자체를 시험할 때) */
+    private static String runStubRaw(StubApi api, String script) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         ConsoleView view = new ConsoleView(
                 new ByteArrayInputStream(script.getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8,
-                new PrintStream(out, true, StandardCharsets.UTF_8), opened::add);
-        new LetterApp(api, view, millis -> { }).run();
+                new PrintStream(out, true, StandardCharsets.UTF_8));
+        new LetterApp(api, view).run();
         return out.toString(StandardCharsets.UTF_8);
-    }
-
-    private static String runStub(StubApi api, String script) {
-        return runStub(api, script, new java.util.ArrayList<>());
     }
 
     private static void loginTests() {
@@ -1259,21 +1287,20 @@ public class LetterTests {
             eq(letter, LetterForm.fromBody(LetterForm.toStoredBody(letter)));
         });
         test("AuthForm: 로그인 안내·결과 왕복 변환, 잘못된 형식은 거절", () -> {
-            LoginTicket ticket = new LoginTicket("lid", "https://x.test/a?b=1&c=2", "ABC-DEF", 600);
+            LoginTicket ticket = new LoginTicket("lid", 300);
             eq(ticket, AuthForm.ticketFromBody(AuthForm.ticketToBody(ticket)));
-            eq(false, AuthForm.pollFromBody(AuthForm.pollToBody(LoginPoll.pending())).isDone());
-            LoginPoll done = new LoginPoll("tok", HONG);
-            eq(done.user(), AuthForm.pollFromBody(AuthForm.pollToBody(done)).user());
-            eq("tok", AuthForm.pollFromBody(AuthForm.pollToBody(done)).token());
-            for (String bad : new String[]{"", "status=OK", "status=OK&token=t&id=abc", "status=???"}) {
+            LoginResult done = new LoginResult("tok", HONG);
+            eq(done.user(), AuthForm.resultFromBody(AuthForm.resultToBody(done)).user());
+            eq("tok", AuthForm.resultFromBody(AuthForm.resultToBody(done)).token());
+            for (String bad : new String[]{"", "token=t", "token=t&id=abc", "id=" + ID_HONG}) {
                 try {
-                    AuthForm.pollFromBody(bad);
+                    AuthForm.resultFromBody(bad);
                 } catch (IllegalArgumentException e) {
                     continue;
                 }
                 throw new AssertionError("예외가 발생하지 않음: " + bad);
             }
-            for (String bad : new String[]{"", "loginId=a&url=b&confirmCode=c", "loginId=a&url=b&confirmCode=c&expiresIn=x"}) {
+            for (String bad : new String[]{"", "loginId=a", "expiresIn=300", "loginId=a&expiresIn=x", "loginId=a&expiresIn=0"}) {
                 try {
                     AuthForm.ticketFromBody(bad);
                 } catch (IllegalArgumentException e) {
@@ -1282,7 +1309,7 @@ public class LetterTests {
                 throw new AssertionError("예외가 발생하지 않음: " + bad);
             }
         });
-        test("LoginPoll: 토큰은 toString에 나오지 않음", () -> lacks(new LoginPoll("SECRET-TOKEN", HONG).toString(), "SECRET-TOKEN"));
+        test("LoginResult: 토큰은 toString에 나오지 않음", () -> lacks(new LoginResult("SECRET-TOKEN", HONG).toString(), "SECRET-TOKEN"));
         test("InboxForm: 순서를 지킨 왕복 변환, 빈 목록, 잘못된 코드는 거절", () -> {
             List<LetterCode> codes = List.of(LetterCode.of("CCCCCCCC"), LetterCode.of("AAAAAAAA"), LetterCode.of("BBBBBBBB"));
             eq(codes, InboxForm.fromBody(InboxForm.toBody(codes)));
@@ -1298,175 +1325,189 @@ public class LetterTests {
         });
 
         // ---------- 설정 ----------
-        test("ServerConfig: 로그인 설정은 세 값이 모두 있어야 켜지고, PUBLIC_URL 끝의 /는 정리됨", () -> {
-            eq(false, ServerConfig.from(Map.of(), new String[0]).loginEnabled());
-            ServerConfig on = ServerConfig.from(Map.of("DISCORD_CLIENT_ID", ID_HONG, "DISCORD_CLIENT_SECRET", "s3cret",
-                    "PUBLIC_URL", "https://letter.example.com//"), new String[0]);
-            eq(true, on.loginEnabled());
-            eq("https://letter.example.com", on.publicUrl());
-            eq("https://letter.example.com/auth/callback", on.redirectUri());
+        test("ServerConfig: 로그인은 봇 토큰으로 켜지고, 예전 OAuth 설정값(CLIENT_ID 등)이 남아 있어도 무시됨", () -> {
+            eq(false, ServerConfig.from(Map.of(), new String[0]).discordEnabled());
+            eq(true, ServerConfig.from(Map.of("DISCORD_BOT_TOKEN", "BOT"), new String[0]).discordEnabled());
+            ServerConfig old = ServerConfig.from(Map.of("DISCORD_BOT_TOKEN", "BOT", "DISCORD_CLIENT_ID", "abc",
+                    "DISCORD_CLIENT_SECRET", "s", "PUBLIC_URL", "not a url"), new String[0]);
+            eq(true, old.discordEnabled());
         });
-        test("ServerConfig: 로그인 설정이 일부만 있거나 값이 이상하면 시작할 때 거절", () -> {
-            for (Map<String, String> bad : List.of(
-                    Map.of("DISCORD_CLIENT_ID", ID_HONG),
-                    Map.of("DISCORD_CLIENT_ID", ID_HONG, "DISCORD_CLIENT_SECRET", "s"),
-                    Map.of("DISCORD_CLIENT_ID", "abc", "DISCORD_CLIENT_SECRET", "s", "PUBLIC_URL", "https://a.com"),
-                    Map.of("DISCORD_CLIENT_ID", ID_HONG, "DISCORD_CLIENT_SECRET", "s", "PUBLIC_URL", "ftp://a.com"),
-                    Map.of("DISCORD_CLIENT_ID", ID_HONG, "DISCORD_CLIENT_SECRET", "s", "PUBLIC_URL", "https://a.com?x=1"),
-                    Map.of("DISCORD_CLIENT_ID", ID_HONG, "DISCORD_CLIENT_SECRET", "s", "PUBLIC_URL", "not a url"))) {
-                try {
-                    ServerConfig.from(bad, new String[0]);
-                } catch (IllegalArgumentException e) {
-                    continue;
-                }
-                throw new AssertionError("예외가 발생하지 않음: " + bad);
-            }
-        });
-        test("ServerConfig: toString에 client secret과 봇 토큰이 나오지 않음", () -> {
-            ServerConfig config = ServerConfig.from(Map.of("DISCORD_CLIENT_ID", ID_HONG, "DISCORD_CLIENT_SECRET", "TOP-SECRET-VALUE",
-                    "PUBLIC_URL", "https://a.com", "DISCORD_BOT_TOKEN", "BOT-TOKEN-VALUE"), new String[0]);
-            lacks(config.toString(), "TOP-SECRET-VALUE");
+        test("ServerConfig: toString에 봇 토큰이 나오지 않음", () -> {
+            ServerConfig config = ServerConfig.from(Map.of("DISCORD_BOT_TOKEN", "BOT-TOKEN-VALUE"), new String[0]);
             lacks(config.toString(), "BOT-TOKEN-VALUE");
         });
 
-        // ---------- 로그인 서비스 ----------
-        test("LoginService: 시작 → 승인 → 확인 코드 → 세션 토큰 (토큰은 한 번만 건네주고, 토큰으로 사용자 확인)", () -> {
-            FakeOAuth oauth = new FakeOAuth().approve("c1", HONG);
-            LoginService login = loginService(oauth, new MutableClock());
-            LoginTicket ticket = login.start();
-            eq(false, login.poll(ticket.loginId()).isDone());                         // 아직
+        // ---------- 로그인 서비스 (디스코드 DM 인증 코드) ----------
+        test("DiscordMessages.loginCode: 코드·유효 시간·'본인이 아니면 무시' 안내만 있고 링크는 없음", () -> {
+            String text = DiscordMessages.loginCode("482913", 5);
+            has(text, "🔐 편지 프로그램 로그인 인증 코드: `482913`");
+            has(text, "(5분 동안만 유효해요)");
+            has(text, "본인이 요청한 게 아니라면 코드를 알려 주지 말고 이 메시지를 무시해 주세요.");
+            lacks(text, "http");
+        });
+        test("LoginService: 시작 → DM으로 6자리 코드 → 코드 입력 → 세션 토큰 (코드는 한 번만, 토큰으로 사용자 확인)", () -> {
+            FakeDiscord discord = discordWithUsers();
+            LoginService login = loginService(discord, new MutableClock());
+            LoginTicket ticket = login.start(DiscordId.of(ID_HONG));
+            eq(300, ticket.expiresInSeconds());
+            eq(1, discord.loginDms.size());
+            eq(ID_HONG, discord.loginDms.get(0)[0]);
+            String code = loginCodeSentTo(discord, ID_HONG);
+            eq(6, code.length());
+            lacks(discord.loginDms.get(0)[1], ticket.loginId());                      // DM에는 loginId가 없다
 
-            eq(HONG, login.receiveApproval(stateOf(ticket), "c1"));
-            eq(false, login.poll(ticket.loginId()).isDone());                         // 승인만으로는 아직 (확인 코드가 남음)
-
-            eq(HONG, login.confirm(stateOf(ticket), ticket.confirmCode()));
-            LoginPoll poll = login.poll(ticket.loginId());
-            eq(true, poll.isDone());
-            eq(HONG, login.authenticate(poll.token()));
-            kind(Kind.NOT_FOUND, () -> login.poll(ticket.loginId()));                 // 토큰은 한 번만
+            LoginResult result = login.verify(ticket.loginId(), code);
+            eq(HONG, result.user());
+            eq(HONG, login.authenticate(result.token()));
+            kind(Kind.NOT_FOUND, () -> login.verify(ticket.loginId(), code));          // 코드는 한 번만
+            eq(1, login.sessionCount());
         });
         test("LoginService: 로그인하지 않았거나 모르는 토큰은 UNAUTHENTICATED", () -> {
-            LoginService login = loginService(new FakeOAuth(), new MutableClock());
+            LoginService login = loginService(discordWithUsers(), new MutableClock());
             kind(Kind.UNAUTHENTICATED, () -> login.authenticate(null));
             kind(Kind.UNAUTHENTICATED, () -> login.authenticate(""));
             kind(Kind.UNAUTHENTICATED, () -> login.authenticate("nope"));
         });
         test("LoginService: 사용자마다 다른 토큰·다른 계정", () -> {
-            FakeOAuth oauth = new FakeOAuth().approve("c1", HONG).approve("c2", KIM);
-            LoginService login = loginService(oauth, new MutableClock());
-            LoginPoll a = fullLogin(login, "c1");
-            LoginPoll b = fullLogin(login, "c2");
+            FakeDiscord discord = discordWithUsers();
+            LoginService login = loginService(discord, new MutableClock());
+            LoginResult a = fullLogin(login, discord, HONG);
+            LoginResult b = fullLogin(login, discord, KIM);
             eq(true, !a.token().equals(b.token()));
             eq(HONG, login.authenticate(a.token()));
             eq(KIM, login.authenticate(b.token()));
         });
-        test("LoginService: 확인 코드는 대소문자·하이픈·공백을 무시하고, 틀리면 거절", () -> {
-            FakeOAuth oauth = new FakeOAuth().approve("c1", HONG);
-            LoginService login = loginService(oauth, new MutableClock());
-            LoginTicket ticket = login.start();
-            login.receiveApproval(stateOf(ticket), "c1");
-            kind(Kind.INVALID, () -> login.confirm(stateOf(ticket), "ZZZ-ZZZ"));
-            kind(Kind.INVALID, () -> login.confirm(stateOf(ticket), null));
-            login.confirm(stateOf(ticket), " " + ticket.confirmCode().toLowerCase().replace("-", "") + " ");
-            eq(true, login.poll(ticket.loginId()).isDone());
-        });
-        test("LoginService: 확인 코드를 5번 틀리면 그 로그인은 취소 (맞는 코드도 소용없음)", () -> {
-            FakeOAuth oauth = new FakeOAuth().approve("c1", HONG);
-            LoginService login = loginService(oauth, new MutableClock());
-            LoginTicket ticket = login.start();
-            login.receiveApproval(stateOf(ticket), "c1");
-            for (int i = 0; i < 5; i++) kind(Kind.INVALID, () -> login.confirm(stateOf(ticket), "WRONG1"));
-            kind(Kind.INVALID, () -> login.confirm(stateOf(ticket), ticket.confirmCode()));
-            kind(Kind.NOT_FOUND, () -> login.poll(ticket.loginId()));
+        test("LoginService: 모르는 loginId나 null은 NOT_FOUND (코드만 알아서는 로그인할 수 없음)", () -> {
+            FakeDiscord discord = discordWithUsers();
+            LoginService login = loginService(discord, new MutableClock());
+            login.start(DiscordId.of(ID_HONG));
+            String code = loginCodeSentTo(discord, ID_HONG);
+            kind(Kind.NOT_FOUND, () -> login.verify("모르는-id", code));
+            kind(Kind.NOT_FOUND, () -> login.verify(null, code));
             eq(0, login.sessionCount());
         });
-        test("LoginService: 승인 전에 확인 코드를 내면 거절 (코드만 알아서는 로그인할 수 없음)", () -> {
-            LoginService login = loginService(new FakeOAuth().approve("c1", HONG), new MutableClock());
-            LoginTicket ticket = login.start();
-            kind(Kind.INVALID, () -> login.confirm(stateOf(ticket), ticket.confirmCode()));
+        test("LoginService: 코드는 공백·하이픈을 무시하고, 틀리면 남은 횟수와 함께 CODE_WRONG", () -> {
+            FakeDiscord discord = discordWithUsers();
+            LoginService login = loginService(discord, new MutableClock());
+            LoginTicket ticket = login.start(DiscordId.of(ID_HONG));
+            String code = loginCodeSentTo(discord, ID_HONG);
+            String wrong = code.equals("000000") ? "111111" : "000000";
+            LetterException first = expect(() -> login.verify(ticket.loginId(), wrong));
+            eq(Kind.CODE_WRONG, first.kind());
+            has(first.getMessage(), "남은 횟수 4번");
+            kind(Kind.CODE_WRONG, () -> login.verify(ticket.loginId(), null));
+            kind(Kind.CODE_WRONG, () -> login.verify(ticket.loginId(), ""));
+            LoginResult ok = login.verify(ticket.loginId(), " " + code.substring(0, 3) + "-" + code.substring(3) + " ");
+            eq(HONG, login.authenticate(ok.token()));
+        });
+        test("LoginService: 코드를 5번 틀리면 그 로그인은 취소 (맞는 코드도 소용없음)", () -> {
+            FakeDiscord discord = discordWithUsers();
+            LoginService login = loginService(discord, new MutableClock());
+            LoginTicket ticket = login.start(DiscordId.of(ID_HONG));
+            String code = loginCodeSentTo(discord, ID_HONG);
+            String wrong = code.equals("000000") ? "111111" : "000000";
+            for (int i = 0; i < 4; i++) kind(Kind.CODE_WRONG, () -> login.verify(ticket.loginId(), wrong));
+            kind(Kind.INVALID, () -> login.verify(ticket.loginId(), wrong));            // 5번째: 취소
+            kind(Kind.NOT_FOUND, () -> login.verify(ticket.loginId(), code));
             eq(0, login.sessionCount());
         });
-        test("LoginService: 같은 state(승인 주소)는 한 번만 쓸 수 있음", () -> {
-            FakeOAuth oauth = new FakeOAuth().approve("c1", HONG).approve("c2", KIM);
-            LoginService login = loginService(oauth, new MutableClock());
-            LoginTicket ticket = login.start();
-            login.receiveApproval(stateOf(ticket), "c1");
-            kind(Kind.INVALID, () -> login.receiveApproval(stateOf(ticket), "c2"));   // 다른 사람 계정으로 덮어쓰기 불가
-            login.confirm(stateOf(ticket), ticket.confirmCode());
-            kind(Kind.INVALID, () -> login.receiveApproval(stateOf(ticket), "c1"));
-            kind(Kind.INVALID, () -> login.confirm(stateOf(ticket), ticket.confirmCode()));
-            kind(Kind.INVALID, () -> login.receiveApproval("모르는-state", "c1"));
-            kind(Kind.INVALID, () -> login.receiveApproval(null, "c1"));
-            kind(Kind.INVALID, () -> login.receiveApproval(stateOf(login.start()), ""));   // code 없음
-        });
-        test("LoginService: 10분이 지나면 로그인 요청이 만료", () -> {
+        test("LoginService: 5분이 지나면 코드가 만료 (4분 59초까지는 유효)", () -> {
             MutableClock clock = new MutableClock();
-            FakeOAuth oauth = new FakeOAuth().approve("c1", HONG);
-            LoginService login = loginService(oauth, clock);
-            LoginTicket ticket = login.start();
-            clock.advanceSeconds(10 * 60 + 1);
-            kind(Kind.INVALID, () -> login.receiveApproval(stateOf(ticket), "c1"));
-            kind(Kind.NOT_FOUND, () -> login.poll(ticket.loginId()));
+            FakeDiscord discord = discordWithUsers();
+            LoginService login = loginService(discord, clock);
+            LoginTicket early = login.start(DiscordId.of(ID_HONG));
+            clock.advanceSeconds(299);
+            eq(HONG, login.verify(early.loginId(), loginCodeSentTo(discord, ID_HONG)).user());
+
+            LoginTicket late = login.start(DiscordId.of(ID_KIM));
+            clock.advanceSeconds(301);
+            kind(Kind.NOT_FOUND, () -> login.verify(late.loginId(), loginCodeSentTo(discord, ID_KIM)));
         });
-        test("LoginService: 확인 코드 입력 전에 만료되면 로그인되지 않음", () -> {
-            MutableClock clock = new MutableClock();
-            LoginService login = loginService(new FakeOAuth().approve("c1", HONG), clock);
-            LoginTicket ticket = login.start();
-            login.receiveApproval(stateOf(ticket), "c1");
-            clock.advanceSeconds(10 * 60 + 1);
-            kind(Kind.INVALID, () -> login.confirm(stateOf(ticket), ticket.confirmCode()));
-            eq(0, login.sessionCount());
+        test("LoginService: 같은 사람이 다시 시작하면 이전 로그인 요청은 무효 (옛 코드·옛 loginId 모두)", () -> {
+            FakeDiscord discord = discordWithUsers();
+            LoginService login = loginService(discord, new MutableClock());
+            LoginTicket first = login.start(DiscordId.of(ID_HONG));
+            String firstCode = loginCodeSentTo(discord, ID_HONG);
+            LoginTicket second = login.start(DiscordId.of(ID_HONG));
+            kind(Kind.NOT_FOUND, () -> login.verify(first.loginId(), firstCode));
+            String secondCode = loginCodeSentTo(discord, ID_HONG);
+            eq(HONG, login.verify(second.loginId(), secondCode).user());
         });
         test("LoginService: 세션은 12시간 뒤 만료되고, 로그아웃하면 바로 끝남", () -> {
             MutableClock clock = new MutableClock();
-            LoginService login = loginService(new FakeOAuth().approve("c1", HONG), clock);
-            String token = fullLogin(login, "c1").token();
+            FakeDiscord discord = discordWithUsers();
+            LoginService login = loginService(discord, clock);
+            String token = fullLogin(login, discord, HONG).token();
             clock.advanceSeconds(11 * 3600);
             eq(HONG, login.authenticate(token));
             clock.advanceSeconds(2 * 3600);
             kind(Kind.UNAUTHENTICATED, () -> login.authenticate(token));
 
-            String second = fullLogin(login, "c1").token();
+            String second = fullLogin(login, discord, HONG).token();
             login.logout(second);
             kind(Kind.UNAUTHENTICATED, () -> login.authenticate(second));
             login.logout("모르는 토큰");                                              // 아무 일도 없음
             login.logout(null);
         });
-        test("LoginService: 디스코드가 승인 코드를 거절하면 INVALID로 로그인 취소, 장애면 UNAVAILABLE", () -> {
-            FakeOAuth oauth = new FakeOAuth().approve("c1", HONG);
-            LoginService login = loginService(oauth, new MutableClock());
-            LoginTicket first = login.start();
-            kind(Kind.INVALID, () -> login.receiveApproval(stateOf(first), "모르는 코드"));
-            kind(Kind.NOT_FOUND, () -> login.poll(first.loginId()));                  // 로그인 요청도 지워짐
+        test("LoginService: 없는 사용자는 NOT_FOUND(DM 없음), DM을 막았으면 INVALID, 디스코드 장애면 UNAVAILABLE — 모두 로그인 요청이 남지 않음", () -> {
+            FakeDiscord discord = discordWithUsers();
+            LoginService login = loginService(discord, new MutableClock());
+            kind(Kind.NOT_FOUND, () -> login.start(DiscordId.of("99999999999999999")));
+            eq(0, discord.loginDms.size());
 
-            oauth.failure = Reason.UNAVAILABLE;
-            LoginTicket second = login.start();
-            kind(Kind.UNAVAILABLE, () -> login.receiveApproval(stateOf(second), "c1"));
+            discord.loginFailure = Reason.DM_NOT_ALLOWED;
+            LetterException dm = expect(() -> login.start(DiscordId.of(ID_HONG)));
+            eq(Kind.INVALID, dm.kind());
+            has(dm.getMessage(), "DM으로 보내지 못했어요");
+            has(dm.getMessage(), "서버에 함께 있는지");
+
+            discord.loginFailure = Reason.UNAVAILABLE;
+            kind(Kind.UNAVAILABLE, () -> login.start(DiscordId.of(ID_KIM)));
+            eq(0, login.sessionCount());
+            eq(0, discord.loginDms.size());
+
+            discord.loginFailure = null;
+            login.start(DiscordId.of(ID_HONG));                                       // 실패한 요청이 한도나 상태를 망치지 않음
+            eq(1, discord.loginDms.size());
         });
-        test("LoginService: 승인 화면에서 취소하면 그 로그인 요청이 사라짐", () -> {
-            LoginService login = loginService(new FakeOAuth().approve("c1", HONG), new MutableClock());
-            LoginTicket ticket = login.start();
-            login.deny(stateOf(ticket));
-            kind(Kind.NOT_FOUND, () -> login.poll(ticket.loginId()));
-            login.deny("모르는 state");                                                // 아무 일도 없음
-            login.deny(null);
+        test("LoginService: 봇이 꺼져 있으면(Disabled) 시작할 때 UNAVAILABLE", () -> {
+            MutableClock clock = new MutableClock();
+            LoginService login = new LoginService(new DisabledDiscordGateway(), clock, new java.util.Random(1),
+                    new RateLimiter(3, Duration.ofMinutes(10), clock));
+            LetterException e = expect(() -> login.start(DiscordId.of(ID_HONG)));
+            eq(Kind.UNAVAILABLE, e.kind());
+            has(e.getMessage(), "디스코드 로그인을 사용할 수 없습니다");
         });
-        test("LoginService: 로그인 설정이 없으면(Disabled) 시작할 때 UNAVAILABLE", () -> {
-            LoginService login = new LoginService(new letter.server.discord.DisabledDiscordOAuth(), new MutableClock(), new java.util.Random(1));
-            kind(Kind.UNAVAILABLE, login::start);
+        test("LoginService: 같은 사람에게 인증 코드 DM은 10분에 3번까지 (다른 사람은 영향 없음, 지나면 다시 가능)", () -> {
+            MutableClock clock = new MutableClock();
+            FakeDiscord discord = discordWithUsers();
+            LoginService login = loginService(discord, clock);
+            for (int i = 0; i < 3; i++) login.start(DiscordId.of(ID_HONG));
+            kind(Kind.RATE_LIMITED, () -> login.start(DiscordId.of(ID_HONG)));
+            eq(3, discord.loginDms.size());                                           // 4번째는 DM도 보내지 않음
+            login.start(DiscordId.of(ID_KIM));
+            clock.advanceSeconds(10 * 60 + 1);
+            login.start(DiscordId.of(ID_HONG));
         });
         test("LoginService: 진행 중인 로그인이 너무 많으면 RATE_LIMITED, 만료되면 다시 가능", () -> {
             MutableClock clock = new MutableClock();
-            LoginService login = loginService(new FakeOAuth(), clock);
-            for (int i = 0; i < 2000; i++) login.start();
-            kind(Kind.RATE_LIMITED, login::start);
-            clock.advanceSeconds(10 * 60 + 1);
-            login.start();
+            FakeDiscord discord = new FakeDiscord();
+            LoginService login = loginService(discord, clock);
+            for (int i = 0; i < 2000; i++) {
+                String id = String.valueOf(10_000_000_000_000_000L + i);
+                discord.users.put(id, "사용자" + i);
+                login.start(DiscordId.of(id));
+            }
+            discord.users.put("20000000000000000", "마지막");
+            kind(Kind.RATE_LIMITED, () -> login.start(DiscordId.of("20000000000000000")));
+            clock.advanceSeconds(5 * 60 + 1);
+            login.start(DiscordId.of("20000000000000000"));
         });
         test("LoginService: 만료된 것을 정리하면 세션 수가 줄어듦", () -> {
             MutableClock clock = new MutableClock();
-            LoginService login = loginService(new FakeOAuth().approve("c1", HONG), clock);
-            fullLogin(login, "c1");
+            FakeDiscord discord = discordWithUsers();
+            LoginService login = loginService(discord, clock);
+            fullLogin(login, discord, HONG);
             eq(1, login.sessionCount());
             clock.advanceSeconds(13 * 3600);
             login.evictExpired();
@@ -1552,97 +1593,18 @@ public class LetterTests {
             }
         }));
 
-        // ---------- 디스코드 OAuth (가짜 디스코드 서버) ----------
-        test("DiscordRestOAuth: 승인 주소에 response_type·client_id·scope=identify·state·redirect_uri가 들어감", () -> {
-            DiscordRestOAuth oauth = new DiscordRestOAuth(ID_HONG, "sec", "https://a.com/auth/callback");
-            String url = oauth.authorizeUrl("st&te 1");
-            has(url, "https://discord.com/oauth2/authorize?");
-            has(url, "response_type=code");
-            has(url, "client_id=" + ID_HONG);
-            has(url, "scope=identify");
-            has(url, "state=st%26te+1");
-            has(url, "redirect_uri=https%3A%2F%2Fa.com%2Fauth%2Fcallback");
-            lacks(url, "sec");
-        });
-        test("DiscordRestOAuth: 코드를 토큰으로 바꾸고(Basic 인증·form) 사용자를 확인한 뒤 토큰을 폐기", () -> {
-            try (FakeDiscordRest rest = new FakeDiscordRest()) {
-                rest.userBody = "{\"id\":\"" + ID_HONG + "\",\"username\":\"gildong\",\"global_name\":\"홍길동\"}";
-                DiscordRestOAuth oauth = new DiscordRestOAuth("1234", "s3cret", "https://a.com/auth/callback", rest.baseUrl(), "https://d.test/authorize");
-                DiscordUser user = oauth.identify("CODE-1");
-                eq(DiscordId.of(ID_HONG), user.id());
-                eq("홍길동 (@gildong)", user.name());
-
-                String basic = "Basic " + java.util.Base64.getEncoder().encodeToString("1234:s3cret".getBytes(StandardCharsets.UTF_8));
-                eq(3, rest.requests.size());
-                has(rest.requests.get(0), "POST /oauth2/token");
-                has(rest.requests.get(0), "auth=" + basic);
-                has(rest.requests.get(0), "grant_type=authorization_code");
-                has(rest.requests.get(0), "code=CODE-1");
-                has(rest.requests.get(0), "redirect_uri=https%3A%2F%2Fa.com%2Fauth%2Fcallback");
-                has(rest.requests.get(1), "GET /users/@me");
-                has(rest.requests.get(1), "auth=Bearer AT123");
-                has(rest.requests.get(2), "POST /oauth2/token/revoke");
-                has(rest.requests.get(2), "token=AT123");
-            }
-        });
-        test("DiscordRestOAuth: 400은 INVALID_CODE, 401은 NOT_CONFIGURED, 5xx·429·접속 불가·이상한 응답은 UNAVAILABLE", () -> {
-            try (FakeDiscordRest rest = new FakeDiscordRest()) {
-                DiscordRestOAuth oauth = new DiscordRestOAuth("1234", "s", "https://a.com/cb", rest.baseUrl(), "https://d.test/a");
-                rest.tokenStatus = 400;
-                reason(Reason.INVALID_CODE, () -> oauth.identify("x"));
-                rest.tokenStatus = 401;
-                reason(Reason.NOT_CONFIGURED, () -> oauth.identify("x"));
-                rest.tokenStatus = 500;
-                reason(Reason.UNAVAILABLE, () -> oauth.identify("x"));
-                rest.tokenStatus = 429;
-                reason(Reason.UNAVAILABLE, () -> oauth.identify("x"));
-                rest.tokenStatus = 200;
-                rest.tokenBody = "{\"token_type\":\"Bearer\"}";                                  // 액세스 토큰 없음
-                reason(Reason.UNAVAILABLE, () -> oauth.identify("x"));
-                rest.tokenBody = "<html>점검 중</html>";
-                reason(Reason.UNAVAILABLE, () -> oauth.identify("x"));
-            }
-            DiscordRestOAuth unreachable = new DiscordRestOAuth("1234", "s", "https://a.com/cb", "http://127.0.0.1:1", "https://d.test/a");
-            reason(Reason.UNAVAILABLE, () -> unreachable.identify("x"));
-        });
-        test("DiscordRestOAuth: 사용자 확인 단계의 실패 — 401은 INVALID_CODE, ID가 없으면 UNAVAILABLE, 그래도 토큰은 폐기 시도", () -> {
-            try (FakeDiscordRest rest = new FakeDiscordRest()) {
-                DiscordRestOAuth oauth = new DiscordRestOAuth("1234", "s", "https://a.com/cb", rest.baseUrl(), "https://d.test/a");
-                rest.userStatus = 401;
-                reason(Reason.INVALID_CODE, () -> oauth.identify("x"));
-                rest.userStatus = 200;
-                rest.userBody = "{\"username\":\"x\"}";
-                reason(Reason.UNAVAILABLE, () -> oauth.identify("x"));
-                eq(2L, rest.requests.stream().filter(r -> r.contains("/oauth2/token/revoke")).count());
-            }
-        });
-        test("DiscordRestOAuth: 오류에 client secret·승인 코드·토큰이 들어 있지 않음", () -> {
-            try (FakeDiscordRest rest = new FakeDiscordRest()) {
-                DiscordRestOAuth oauth = new DiscordRestOAuth("1234", "TOP-SECRET", "https://a.com/cb", rest.baseUrl(), "https://d.test/a");
-                for (int status : new int[]{400, 401, 500}) {
-                    rest.tokenStatus = status;
-                    try {
-                        oauth.identify("CODE-XYZ");
-                    } catch (DiscordGatewayException e) {
-                        lacks(e.getMessage(), "TOP-SECRET");
-                        lacks(e.getMessage(), "CODE-XYZ");
-                        lacks(e.getMessage(), "AT123");
-                    }
-                }
-            }
-        });
-
         // ---------- 콘솔 앱 (가짜 API) ----------
-        test("[앱] 시작하면 로그인부터: 주소·확인 코드를 보여 주고 브라우저를 열며, 승인될 때까지 기다린 뒤 메뉴가 열림", () -> {
+        test("[앱] 시작하면 로그인부터: 내 ID 입력 → DM 안내 → 인증 코드 입력 → 메뉴가 열림", () -> {
             StubApi api = new StubApi();
-            api.pendingPolls = 3;
-            List<String> opened = new java.util.ArrayList<>();
-            String out = runStub(api, "5\n", opened);
-            has(out, "https://discord.test/auth?state=s1");
-            has(out, "확인 코드: ABC-DEF");
+            String out = runStubRaw(api, STUB_LOGIN + "5\n");
+            has(out, "내 디스코드 ID");
+            has(out, "편지 봇이 DM으로 인증 코드를 보내 줘요");
+            has(out, "디스코드 DM으로 인증 코드를 보냈어요");
+            has(out, "5분 안에 입력해 주세요");
             has(out, "홍길동 (@gildong) 님으로 로그인했어요.");
-            eq(List.of("https://discord.test/auth?state=s1"), opened);
-            eq(4, api.polls);                                                        // 3번 "아직" 뒤 4번째에 완료
+            eq(List.of(DiscordId.of(ID_HONG)), api.startedFor);
+            eq(List.of(LOGIN_CODE), api.codesTried);
+            lacks(out, "브라우저");
             eq(true, out.indexOf("님으로 로그인했어요.") < out.indexOf("===== 편지 ====="));   // 로그인이 먼저
             eq(1, api.logouts);                                                      // 종료할 때 로그아웃
         });
@@ -1652,37 +1614,68 @@ public class LetterTests {
             has(out, "5. 종료");
             has(out, "프로그램을 종료합니다.");
         });
-        test("[앱] 로그인을 시작하지 못하면 다시 시도할지 묻고, 그만두면 메뉴 없이 종료", () -> {
+        test("[앱] ID 형식이 틀리면 다시 입력받고, 비워 두면 그만둠 (서버에는 묻지 않음)", () -> {
+            StubApi api = new StubApi();
+            String out = runStubRaw(api, "abc\n홍길동#1234\n" + STUB_LOGIN + "5\n");
+            has(out, "올바르지 않은 디스코드 ID입니다.");
+            eq(1, api.logins);
+            has(out, "님으로 로그인했어요.");
+
+            StubApi quit = new StubApi();
+            String out2 = runStubRaw(quit, "\n");
+            has(out2, "로그인하지 못해 프로그램을 종료합니다.");
+            lacks(out2, "===== 편지 =====");
+            eq(0, quit.logins);
+            eq(1, quit.logouts);
+        });
+        test("[앱] 인증 코드를 보내지 못하면 다시 시도할지 묻고, 그만두면 메뉴 없이 종료", () -> {
             StubApi api = new StubApi();
             api.startFailure = new ApiException("서버 점검 중", true);
-            String out = runStub(api, "n\n");
-            has(out, "로그인을 시작하지 못했어요: 서버 점검 중");
+            String out = runStubRaw(api, ID_HONG + "\nn\n");
+            has(out, "인증 코드를 보내지 못했어요: 서버 점검 중");
             has(out, "로그인하지 못해 프로그램을 종료합니다.");
             lacks(out, "===== 편지 =====");
             eq(1, api.logouts);
 
             StubApi retry = new StubApi();
             retry.startFailure = new ApiException("서버 점검 중", true);
-            has(runStub(retry, "y\n5\n"), "님으로 로그인했어요.");                     // 다시 시도하면 로그인됨
+            has(runStubRaw(retry, ID_HONG + "\ny\n" + STUB_LOGIN + "5\n"), "님으로 로그인했어요.");   // 다시 시도하면 로그인됨
         });
-        test("[앱] 승인 대기 중 만료·거절되면 알리고 다시 로그인할지 물음", () -> {
+        test("[앱] 인증 코드가 틀리면 남은 횟수를 알리고 다시 입력받음", () -> {
             StubApi api = new StubApi();
-            api.pollFailures = 1;
-            api.pollFailure = new ApiException("로그인 요청이 없거나 만료되었습니다.", false);
-            String out = runStub(api, "y\n5\n");
+            api.wrongCodes = 2;
+            String out = runStubRaw(api, ID_HONG + "\n111111\n222222\n" + LOGIN_CODE + "\n5\n");
+            has(out, "인증 코드가 맞지 않아요. (남은 횟수 2번)");
+            has(out, "인증 코드가 맞지 않아요. (남은 횟수 1번)");
+            eq(List.of("111111", "222222", LOGIN_CODE), api.codesTried);
+            eq(1, api.logins);                                                       // 같은 로그인 안에서 다시 입력
+            has(out, "님으로 로그인했어요.");
+        });
+        test("[앱] 인증 코드 칸을 비워 두면 인증을 취소하고, 다시 로그인할지 물음", () -> {
+            StubApi api = new StubApi();
+            String out = runStubRaw(api, ID_HONG + "\n\nn\n");
+            has(out, "인증을 취소했어요.");
+            has(out, "다시 로그인할까요?");
+            lacks(out, "===== 편지 =====");
+            eq(List.of(), api.codesTried);
+        });
+        test("[앱] 인증 코드가 만료·취소되면 알리고 다시 로그인할지 물음, 다시 하면 새 코드를 요청", () -> {
+            StubApi api = new StubApi();
+            api.verifyFailure = new ApiException("로그인 요청이 없거나 만료되었습니다.", false);
+            String out = runStubRaw(api, ID_HONG + "\n" + LOGIN_CODE + "\ny\n" + STUB_LOGIN + "5\n");
             has(out, "로그인에 실패했어요: 로그인 요청이 없거나 만료되었습니다.");
             has(out, "다시 로그인할까요?");
             eq(2, api.logins);
             has(out, "님으로 로그인했어요.");
         });
-        test("[앱] 서버와 연결이 5번 연달아 끊기면 기다리기를 멈춤", () -> {
+        test("[앱] 통신이 잠깐 끊긴 경우(다시 해 볼 만한 오류)에는 같은 로그인으로 코드를 다시 입력받음", () -> {
             StubApi api = new StubApi();
-            api.pollFailures = 99;
-            api.pollFailure = new ApiException("서버에 연결할 수 없습니다.", true);
-            String out = runStub(api, "n\n");
-            has(out, "서버와 연결이 계속 끊겨요");
-            eq(5, api.polls);
-            has(out, "로그인하지 못해 프로그램을 종료합니다.");
+            api.verifyFailure = new ApiException("서버에 연결할 수 없습니다.", true);
+            String out = runStubRaw(api, ID_HONG + "\n" + LOGIN_CODE + "\n" + LOGIN_CODE + "\n5\n");
+            has(out, "로그인에 실패했어요: 서버에 연결할 수 없습니다.");
+            eq(1, api.logins);
+            eq(List.of(LOGIN_CODE, LOGIN_CODE), api.codesTried);
+            has(out, "님으로 로그인했어요.");
         });
         test("[앱] 메뉴 4: 받은 편지 코드만 한 줄씩, 서버가 준 순서(최신순) 그대로", () -> {
             StubApi api = new StubApi();
@@ -1702,15 +1695,17 @@ public class LetterTests {
             StubApi api = new StubApi();
             api.inbox = List.of(LetterCode.of("AAAAAAAA"));
             api.loginRequiredCalls = 1;
-            String out = runStub(api, "4\n5\n");
+            String out = runStub(api, "4\n" + LOGIN_CODE + "\n5\n");         // 다시 로그인할 때는 ID를 다시 묻지 않고 코드만
             has(out, "로그인이 만료되었습니다.");
+            has(out, "님 계정으로 다시 로그인해요.");
             eq(2, api.logins);
+            eq(List.of(DiscordId.of(ID_HONG), DiscordId.of(ID_HONG)), api.startedFor);
             has(out, "받은 편지 1통 (최신순)");
         });
         test("[앱] 편지를 보내는 중 로그인이 만료되면 다시 로그인하고, 쓴 편지를 그대로 보냄 (두 번 보내지 않음)", () -> {
             StubApi api = new StubApi();
             api.loginRequiredCalls = 1;
-            String out = runStub(api, "1\n안녕\n/end\n\ny\n5\n");
+            String out = runStub(api, "1\n안녕\n/end\n\ny\n" + LOGIN_CODE + "\n5\n");
             eq(List.of("안녕"), api.sent);
             eq(2, api.logins);
             has(out, "편지를 발송했습니다!");
@@ -1739,15 +1734,21 @@ public class LetterTests {
         });
 
         // ---------- 실제 서버 + 실제 클라이언트 ----------
-        test("[E2E] 시작할 때 로그인하고, 종료하면 서버의 로그인도 끝남", () -> withOAuthServer(new FakeDiscord(), (server, oauth, dir) -> {
-            TestApi api = new TestApi(server.port(), CODE_CHUL);
-            String out = runAppOnly(api, "5\n");
-            has(out, "철수 님으로 로그인했어요.");
-            has(out, "확인 코드: " + api.lastTicket.confirmCode());
-            String token = api.tokens.get(api.tokens.size() - 1);
-            var res = anonymousHttp("GET", "http://127.0.0.1:" + server.port() + "/letters/inbox", null, token);
-            eq(401, res.statusCode());                                               // 종료하면서 로그아웃했으므로 그 토큰은 더 이상 못 씀
-        }));
+        test("[E2E] 시작할 때 로그인(ID 입력 → DM으로 인증 코드 → 코드 입력)하고, 종료하면 서버의 로그인도 끝남", () -> {
+            FakeDiscord discord = new FakeDiscord();
+            withLoginServer(discord, (server, dir) -> {
+                TestApi api = new TestApi(server.port(), SENDER);
+                String out = runAppOnly(api, "5\n");
+                has(out, "디스코드 DM으로 인증 코드를 보냈어요");
+                has(out, "철수 님으로 로그인했어요.");
+                eq(1, discord.loginDms.size());
+                eq(ID_CHUL, discord.loginDms.get(0)[0]);
+                has(discord.loginDms.get(0)[1], "인증 코드: `" + LOGIN_CODE + "`");
+                String token = api.tokens.get(api.tokens.size() - 1);
+                var res = anonymousHttp("GET", "http://127.0.0.1:" + server.port() + "/letters/inbox", null, token);
+                eq(401, res.statusCode());                                           // 종료하면서 로그아웃했으므로 그 토큰은 더 이상 못 씀
+            });
+        });
         test("[E2E] 로그인 없이는 편지·목록·디스코드 조회가 모두 401(login=required), 로그인 주소는 열려 있음", () -> withServer(new FakeDiscord(), (server, api, dir) -> {
             String base = "http://127.0.0.1:" + server.port();
             for (String[] call : new String[][]{
@@ -1761,7 +1762,7 @@ public class LetterTests {
                     eq("Bearer", res.headers().firstValue("WWW-Authenticate").orElse(""));
                 }
             }
-            eq(200, anonymousHttp("POST", base + "/auth/login", null).statusCode());
+            eq(400, anonymousHttp("POST", base + "/auth/login", null).statusCode());      // 로그인 주소는 로그인 없이 열려 있다 (ID가 없으니 400)
             eq(405, anonymousHttp("GET", base + "/auth/login", null).statusCode());
             eq(404, anonymousHttp("GET", base + "/auth/unknown", null).statusCode());
 
@@ -1818,9 +1819,8 @@ public class LetterTests {
             FakeDiscord discord = new FakeDiscord();
             discord.users.put(ID_HONG, "홍길동 (@gildong)");
             discord.users.put(ID_KIM, "김철수");
-            withOAuthServer(discord, (server, oauth, dir) -> {
-                oauth.approve(CODE_HONG, HONG).approve(CODE_KIM, KIM);
-                TestApi chul = new TestApi(server.port(), CODE_CHUL);
+            withLoginServer(discord, (server, dir) -> {
+                TestApi chul = new TestApi(server.port(), SENDER);
                 chul.login();
                 LetterCode first = chul.sendToDiscord(new LetterDraft("첫째"), DiscordId.of(ID_HONG)).code();
                 LetterCode second = chul.sendToDiscord(new LetterDraft("둘째"), DiscordId.of(ID_HONG)).code();
@@ -1831,11 +1831,11 @@ public class LetterTests {
                 LetterCode toKim = chul.sendToDiscord(new LetterDraft("김에게"), DiscordId.of(ID_KIM)).code();
                 chul.send(new LetterDraft("디스코드 없이"));
 
-                TestApi hong = new TestApi(server.port(), CODE_HONG);
+                TestApi hong = new TestApi(server.port(), HONG);
                 hong.login();
                 eq(List.of(failed.code(), second, first), hong.inbox());
 
-                TestApi kim = new TestApi(server.port(), CODE_KIM);
+                TestApi kim = new TestApi(server.port(), KIM);
                 kim.login();
                 eq(List.of(toKim), kim.inbox());
                 eq(List.of(), chul.inbox());                                          // 보낸 사람 목록에는 없다
@@ -1844,14 +1844,13 @@ public class LetterTests {
         test("[E2E] 받은 편지 목록: 메뉴 4에서 코드만 보임", () -> {
             FakeDiscord discord = new FakeDiscord();
             discord.users.put(ID_HONG, "홍길동 (@gildong)");
-            withOAuthServer(discord, (server, oauth, dir) -> {
-                oauth.approve(CODE_HONG, HONG);
-                TestApi chul = new TestApi(server.port(), CODE_CHUL);
+            withLoginServer(discord, (server, dir) -> {
+                TestApi chul = new TestApi(server.port(), SENDER);
                 chul.login();
                 LetterCode a = chul.sendToDiscord(new LetterDraft("비밀 내용 A"), DiscordId.of(ID_HONG)).code();
                 LetterCode b = chul.sendToDiscord(new LetterDraft("비밀 내용 B"), DiscordId.of(ID_HONG)).code();
 
-                String out = runApp(new TestApi(server.port(), CODE_HONG), "4\n5\n");
+                String out = runApp(new TestApi(server.port(), HONG), "4\n5\n");
                 has(out, "받은 편지 2통 (최신순)");
                 eq(true, out.indexOf(b.value()) < out.indexOf(a.value()));
                 lacks(out, "비밀 내용");
@@ -1861,13 +1860,12 @@ public class LetterTests {
         test("[E2E] 받은 편지 목록: 답장 편지는 원본을 보낸 사람의 목록에 올라가고, 서버 응답에 전달 대상은 드러나지 않음", () -> {
             FakeDiscord discord = new FakeDiscord();
             discord.users.put(ID_HONG, "홍길동 (@gildong)");
-            withOAuthServer(discord, (server, oauth, dir) -> {
-                oauth.approve(CODE_HONG, HONG);
-                TestApi chul = new TestApi(server.port(), CODE_CHUL);
+            withLoginServer(discord, (server, dir) -> {
+                TestApi chul = new TestApi(server.port(), SENDER);
                 chul.login();
                 LetterCode original = chul.sendToDiscord(new LetterDraft("안녕"), DiscordId.of(ID_HONG), SENDER.id()).code();
 
-                TestApi hong = new TestApi(server.port(), CODE_HONG);
+                TestApi hong = new TestApi(server.port(), HONG);
                 hong.login();
                 LetterCode reply = hong.reply(original, "답장이에요").code();
                 eq(List.of(original), hong.inbox());                                  // 홍길동 목록에는 받은 원본뿐, 자기가 쓴 답장은 없음
@@ -1879,23 +1877,23 @@ public class LetterTests {
         });
         test("[E2E] 서버를 다시 시작해도 받은 편지 목록이 유지됨 (세션은 사라져 다시 로그인)", () -> withTempDir(dir -> {
             FakeDiscord discord = new FakeDiscord();
-            FakeOAuth oauth = new FakeOAuth().approve(CODE_CHUL, SENDER).approve(CODE_HONG, HONG);
+            discord.users.put(ID_HONG, "홍길동 (@gildong)");
             ServerConfig config = new ServerConfig(0, dir, 2_000_000, 1000, ZoneId.of("Asia/Seoul"), null);
-            LetterServer first = new LetterServer(config, discord, oauth);
+            LetterServer first = testServer(config, discord, true);
             first.start();
             LetterCode code;
             TestApi oldSession;
             try {
-                oldSession = new TestApi(first.port(), CODE_CHUL);
+                oldSession = new TestApi(first.port(), SENDER);
                 oldSession.login();
                 code = oldSession.sendToDiscord(new LetterDraft("안녕"), DiscordId.of(ID_HONG)).code();
             } finally {
                 first.stop();
             }
-            LetterServer second = new LetterServer(config, discord, oauth);
+            LetterServer second = testServer(config, discord, true);
             second.start();
             try {
-                TestApi hong = new TestApi(second.port(), CODE_HONG);
+                TestApi hong = new TestApi(second.port(), HONG);
                 hong.login();
                 eq(List.of(code), hong.inbox());
                 var res = anonymousHttp("GET", "http://127.0.0.1:" + second.port() + "/letters/inbox", null, oldSession.token);
@@ -1904,114 +1902,115 @@ public class LetterTests {
                 second.stop();
             }
         }));
-        test("[E2E] 로그인 확인 화면: 디스코드 이름은 이스케이프되고, 다른 사이트가 감싸 쓸 수 없는 보안 헤더가 붙음", () -> {
-            String evil = "<script>alert(1)</script>\"'&";
-            withOAuthServer(new FakeDiscord(), (server, oauth, dir) -> {
-                oauth.approve("evil", new DiscordUser(DiscordId.of(ID_KIM), evil));
+        test("[E2E] 로그인 API: 인증 코드는 DM으로만 가고, 틀리면 403(남은 횟수), 맞으면 로그인 완료", () -> {
+            FakeDiscord discord = discordWithUsers();
+            withLoginServer(discord, (server, dir) -> {
                 HttpLetterApi api = new HttpLetterApi("http://127.0.0.1:" + server.port());
-                LoginTicket ticket = api.startLogin();
-                var res = anonymousHttp("GET", "http://127.0.0.1:" + server.port() + "/auth/callback?state=" + stateOf(ticket) + "&code=evil", null);
-                eq(200, res.statusCode());
-                lacks(res.body(), "<script>alert");
-                has(res.body(), "&lt;script&gt;alert(1)&lt;/script&gt;");
-                has(res.headers().firstValue("Content-Security-Policy").orElse(""), "frame-ancestors 'none'");
-                has(res.headers().firstValue("Content-Security-Policy").orElse(""), "default-src 'none'");
-                eq("DENY", res.headers().firstValue("X-Frame-Options").orElse(""));
-                eq("no-store", res.headers().firstValue("Cache-Control").orElse(""));
-                has(res.headers().firstValue("Content-Type").orElse(""), "text/html");
+                LoginTicket ticket = api.startLogin(HONG.id());
+                eq(300, ticket.expiresInSeconds());
+                eq(ID_HONG, discord.loginDms.get(0)[0]);
+                has(discord.loginDms.get(0)[1], "인증 코드: `" + LOGIN_CODE + "`");
+
+                try {
+                    api.verifyLogin(ticket, "000000");
+                    throw new AssertionError("예외가 발생하지 않음");
+                } catch (CodeWrongException e) {
+                    has(e.getMessage(), "남은 횟수 4번");
+                    eq(false, e.isRetryable());
+                }
+                try {
+                    api.inbox();
+                    throw new AssertionError("예외가 발생하지 않음");
+                } catch (LoginRequiredException expected) {
+                    // 아직 로그인 전
+                }
+                LoginResult ok = api.verifyLogin(ticket, LOGIN_CODE.substring(0, 3) + " " + LOGIN_CODE.substring(3));
+                eq(HONG, ok.user());
+                eq(List.of(), api.inbox());                                           // 이 api는 이제 로그인 상태
             });
         });
-        test("[E2E] 확인 코드가 틀리면 다시 입력받고, 맞는 코드(대소문자·하이픈 무관)로 로그인 완료", () -> withOAuthServer(new FakeDiscord(), (server, oauth, dir) -> {
-            String base = "http://127.0.0.1:" + server.port();
-            HttpLetterApi api = new HttpLetterApi(base);
-            LoginTicket ticket = api.startLogin();
-            eq(200, anonymousHttp("GET", base + "/auth/callback?state=" + stateOf(ticket) + "&code=" + CODE_CHUL, null).statusCode());
-
-            var wrong = anonymousHttp("POST", base + "/auth/confirm", "state=" + stateOf(ticket) + "&code=ZZZ-ZZZ");
-            eq(400, wrong.statusCode());
-            has(wrong.body(), "확인 코드가 맞지 않습니다");
-            has(wrong.body(), "<form");                                               // 다시 입력할 수 있다
-            eq(false, api.pollLogin(ticket).isDone());
-
-            var ok = anonymousHttp("POST", base + "/auth/confirm", "state=" + stateOf(ticket) + "&code="
-                    + ticket.confirmCode().toLowerCase().replace("-", ""));
-            eq(200, ok.statusCode());
-            LoginPoll poll = api.pollLogin(ticket);
-            eq(true, poll.isDone());
-            eq(SENDER, poll.user());
-            eq(List.of(), api.inbox());                                               // 이 api는 이제 로그인 상태
-        }));
-        test("[E2E] 확인 코드를 5번 틀리면 로그인 취소 (화면에 입력창이 사라지고, 프로그램도 실패를 알게 됨)", () -> withOAuthServer(new FakeDiscord(), (server, oauth, dir) -> {
-            String base = "http://127.0.0.1:" + server.port();
-            HttpLetterApi api = new HttpLetterApi(base);
-            LoginTicket ticket = api.startLogin();
-            anonymousHttp("GET", base + "/auth/callback?state=" + stateOf(ticket) + "&code=" + CODE_CHUL, null);
-            var last = anonymousHttp("POST", base + "/auth/confirm", "state=" + stateOf(ticket) + "&code=A");
-            for (int i = 0; i < 4; i++) last = anonymousHttp("POST", base + "/auth/confirm", "state=" + stateOf(ticket) + "&code=B" + i);
-            has(last.body(), "취소했습니다");
-            lacks(last.body(), "<form");
+        test("[E2E] 인증 코드를 5번 틀리면 로그인 취소 (프로그램도 코드 재입력 대신 실패를 알게 됨)", () -> {
+            FakeDiscord discord = discordWithUsers();
+            withLoginServer(discord, (server, dir) -> {
+                HttpLetterApi api = new HttpLetterApi("http://127.0.0.1:" + server.port());
+                LoginTicket ticket = api.startLogin(HONG.id());
+                for (int i = 0; i < 4; i++) {
+                    try {
+                        api.verifyLogin(ticket, "00000" + i);
+                        throw new AssertionError("예외가 발생하지 않음");
+                    } catch (CodeWrongException expected) {
+                        // 아직 다시 입력할 수 있다
+                    }
+                }
+                try {
+                    api.verifyLogin(ticket, "000009");
+                    throw new AssertionError("예외가 발생하지 않음");
+                } catch (CodeWrongException e) {
+                    throw new AssertionError("5번째는 취소여야 함: " + e.getMessage());
+                } catch (ApiException e) {
+                    eq(false, e.isRetryable());
+                    has(e.getMessage(), "취소");
+                }
+                try {
+                    api.verifyLogin(ticket, LOGIN_CODE);                              // 맞는 코드도 소용없다
+                    throw new AssertionError("예외가 발생하지 않음");
+                } catch (ApiException e) {
+                    has(e.getMessage(), "만료되었습니다");
+                }
+            });
+        });
+        test("[E2E] loginId를 모르면 코드를 알아도 로그인할 수 없고, 로그인 시작 응답에는 코드가 들어 있지 않음", () -> {
+            FakeDiscord discord = discordWithUsers();
+            withLoginServer(discord, (server, dir) -> {
+                String base = "http://127.0.0.1:" + server.port();
+                var start = anonymousHttp("POST", base + "/auth/login", "discordId=" + ID_HONG);
+                eq(200, start.statusCode());
+                lacks(start.body(), LOGIN_CODE);
+                lacks(discord.loginDms.get(0)[1], FormCodec.decode(start.body()).get("loginId"));
+                eq(404, anonymousHttp("POST", base + "/auth/verify", "loginId=guess&code=" + LOGIN_CODE).statusCode());
+                eq(404, anonymousHttp("POST", base + "/auth/verify", "code=" + LOGIN_CODE).statusCode());
+                eq(405, anonymousHttp("GET", base + "/auth/verify", null).statusCode());
+            });
+        });
+        test("[E2E] 로그인 시작 오류: ID 없음·형식 오류는 400, 없는 사용자는 404, DM을 못 보내면 안내와 함께 400", () -> {
+            FakeDiscord discord = discordWithUsers();
+            withLoginServer(discord, (server, dir) -> {
+                String base = "http://127.0.0.1:" + server.port();
+                eq(400, anonymousHttp("POST", base + "/auth/login", "discordId=abc").statusCode());
+                eq(400, anonymousHttp("POST", base + "/auth/login", "x=y").statusCode());
+                eq(404, anonymousHttp("POST", base + "/auth/login", "discordId=99999999999999999").statusCode());
+                discord.loginFailure = Reason.DM_NOT_ALLOWED;
+                var res = anonymousHttp("POST", base + "/auth/login", "discordId=" + ID_HONG);
+                eq(400, res.statusCode());
+                has(FormCodec.decode(res.body()).get("error"), "DM으로 보내지 못했어요");
+                discord.loginFailure = Reason.UNAVAILABLE;
+                eq(503, anonymousHttp("POST", base + "/auth/login", "discordId=" + ID_HONG).statusCode());
+                eq(0, discord.loginDms.size());
+            });
+        });
+        test("[E2E] 같은 사람에게 인증 코드 요청은 10분에 3번까지, 4번째는 429 (DM도 가지 않음)", () -> withTempDir(dir -> {
+            FakeDiscord discord = discordWithUsers();
+            ServerConfig config = new ServerConfig(0, dir, 2_000_000, 1000, ZoneId.of("Asia/Seoul"), null);
+            LetterServer server = testServer(config, discord, false);   // 운영과 같은 횟수 제한
+            server.start();
             try {
-                api.pollLogin(ticket);
-                throw new AssertionError("예외가 발생하지 않음");
-            } catch (ApiException e) {
-                eq(false, e.isRetryable());
+                String base = "http://127.0.0.1:" + server.port();
+                for (int i = 0; i < 3; i++) eq(200, anonymousHttp("POST", base + "/auth/login", "discordId=" + ID_HONG).statusCode());
+                eq(429, anonymousHttp("POST", base + "/auth/login", "discordId=" + ID_HONG).statusCode());
+                eq(3, discord.loginDms.size());
+                eq(200, anonymousHttp("POST", base + "/auth/login", "discordId=" + ID_KIM).statusCode());
+            } finally {
+                server.stop();
             }
         }));
-        test("[E2E] 승인만으로는 토큰이 나오지 않고, 승인 화면에서 취소하면 로그인 요청이 사라지며, 같은 주소는 다시 쓸 수 없음", () -> withOAuthServer(new FakeDiscord(), (server, oauth, dir) -> {
-            String base = "http://127.0.0.1:" + server.port();
-            HttpLetterApi api = new HttpLetterApi(base);
-
-            LoginTicket ticket = api.startLogin();
-            anonymousHttp("GET", base + "/auth/callback?state=" + stateOf(ticket) + "&code=" + CODE_CHUL, null);
-            eq(false, api.pollLogin(ticket).isDone());                                // 확인 코드 전에는 아직
-
-            LoginTicket cancelled = api.startLogin();
-            var res = anonymousHttp("GET", base + "/auth/callback?state=" + stateOf(cancelled) + "&error=access_denied", null);
-            eq(200, res.statusCode());
-            has(res.body(), "취소");
-            try {
-                api.pollLogin(cancelled);
-                throw new AssertionError("예외가 발생하지 않음");
-            } catch (ApiException e) {
-                eq(false, e.isRetryable());
-            }
-
-            LoginTicket used = api.startLogin();
-            anonymousHttp("GET", base + "/auth/callback?state=" + stateOf(used) + "&code=" + CODE_CHUL, null);
-            eq(400, anonymousHttp("GET", base + "/auth/callback?state=" + stateOf(used) + "&code=" + CODE_CHUL, null).statusCode());
-            eq(400, anonymousHttp("GET", base + "/auth/callback?state=모르는값&code=" + CODE_CHUL, null).statusCode());
-            eq(400, anonymousHttp("GET", base + "/auth/callback", null).statusCode());
-            eq(405, anonymousHttp("POST", base + "/auth/callback", "x=y").statusCode());
-        }));
-        test("[E2E] 다른 사람의 승인 주소로 내 프로그램이 로그인되지 않음 (loginId는 프로그램만 알고, state로는 poll할 수 없음)", () -> withOAuthServer(new FakeDiscord(), (server, oauth, dir) -> {
-            String base = "http://127.0.0.1:" + server.port();
-            HttpLetterApi api = new HttpLetterApi(base);
-            LoginTicket ticket = api.startLogin();
-            has(ticket.url(), "state=");
-            lacks(ticket.url(), ticket.loginId());                                    // 주소에는 loginId가 없다
-            var res = anonymousHttp("POST", base + "/auth/poll", "loginId=" + stateOf(ticket));
-            eq(404, res.statusCode());                                                // state를 loginId로 써도 안 된다
-        }));
-        test("[E2E] 디스코드가 승인 코드를 거절하면 400 화면, 디스코드 장애면 503 화면 (프로그램은 계속 기다리지 않음)", () -> withOAuthServer(new FakeDiscord(), (server, oauth, dir) -> {
-            String base = "http://127.0.0.1:" + server.port();
-            HttpLetterApi api = new HttpLetterApi(base);
-            LoginTicket rejected = api.startLogin();
-            eq(400, anonymousHttp("GET", base + "/auth/callback?state=" + stateOf(rejected) + "&code=모르는코드", null).statusCode());
-
-            oauth.failure = Reason.UNAVAILABLE;
-            LoginTicket down = api.startLogin();
-            var res = anonymousHttp("GET", base + "/auth/callback?state=" + stateOf(down) + "&code=" + CODE_CHUL, null);
-            eq(503, res.statusCode());
-            has(res.body(), "다시 시도");
-        }));
-        test("[E2E] 로그인 설정이 없는 서버: 로그인을 시작할 수 없다고 안내하고, 편지 기능은 모두 막힘", () -> withTempDir(dir -> {
+        test("[E2E] 봇이 꺼진 서버(토큰 없음): 로그인을 시작할 수 없다고 안내하고, 편지 기능은 모두 막힘", () -> withTempDir(dir -> {
             ServerConfig config = new ServerConfig(0, dir, 2_000_000, 1000, ZoneId.of("Asia/Seoul"), null);
             LetterServer server = new LetterServer(config);
             server.start();
             try {
                 HttpLetterApi api = new HttpLetterApi("http://127.0.0.1:" + server.port());
                 try {
-                    api.startLogin();
+                    api.startLogin(SENDER.id());
                     throw new AssertionError("예외가 발생하지 않음");
                 } catch (ApiException e) {
                     has(e.getMessage(), "디스코드 로그인을 사용할 수 없습니다");
@@ -2021,27 +2020,46 @@ public class LetterTests {
                 server.stop();
             }
         }));
-        test("[E2E] 로그아웃하면 그 세션은 바로 무효, 다른 세션은 영향 없음", () -> withOAuthServer(new FakeDiscord(), (server, oauth, dir) -> {
-            oauth.approve(CODE_HONG, HONG);
-            TestApi a = new TestApi(server.port(), CODE_CHUL);
-            TestApi b = new TestApi(server.port(), CODE_HONG);
-            a.login();
-            b.login();
-            String oldToken = a.token;
-            a.logout();
-            eq(401, anonymousHttp("GET", "http://127.0.0.1:" + server.port() + "/letters/inbox", null, oldToken).statusCode());
-            eq(List.of(), b.inbox());
+        test("[E2E] 예전 브라우저 로그인 주소(/auth/callback·poll·confirm)는 더 이상 없음", () -> withLoginServer(new FakeDiscord(), (server, dir) -> {
+            String base = "http://127.0.0.1:" + server.port();
+            eq(404, anonymousHttp("GET", base + "/auth/callback?state=x&code=y", null).statusCode());
+            eq(404, anonymousHttp("POST", base + "/auth/poll", "loginId=x").statusCode());
+            eq(404, anonymousHttp("POST", base + "/auth/confirm", "state=x&code=y").statusCode());
         }));
+        test("[E2E] 로그아웃하면 그 세션은 바로 무효, 다른 세션은 영향 없음", () -> {
+            FakeDiscord discord = discordWithUsers();
+            withLoginServer(discord, (server, dir) -> {
+                TestApi a = new TestApi(server.port(), SENDER);
+                TestApi b = new TestApi(server.port(), HONG);
+                a.login();
+                b.login();
+                String oldToken = a.token;
+                a.logout();
+                eq(401, anonymousHttp("GET", "http://127.0.0.1:" + server.port() + "/letters/inbox", null, oldToken).statusCode());
+                eq(List.of(), b.inbox());
+            });
+        });
     }
 
     // ---------------------------------------------------------------- 디스코드 테스트용 도구
 
-    /** 디스코드 대신 쓰는 가짜 게이트웨이. */
+    /** 디스코드 대신 쓰는 가짜 게이트웨이. 로그인 인증 코드 DM은 편지·답장 DM과 따로 기록한다. */
     private static class FakeDiscord implements DiscordGateway {
         final Map<String, String> users = new LinkedHashMap<>();
-        final List<String[]> dms = new CopyOnWriteArrayList<>();      // {받는 사람 ID, 내용}
-        volatile DiscordGatewayException.Reason dmFailure = null;
+        final List<String[]> dms = new CopyOnWriteArrayList<>();       // {받는 사람 ID, 내용}: 편지·답장 DM
+        final List<String[]> loginDms = new CopyOnWriteArrayList<>();  // {받는 사람 ID, 내용}: 로그인 인증 코드 DM
+        volatile DiscordGatewayException.Reason dmFailure = null;      // 편지·답장 DM 실패
+        volatile DiscordGatewayException.Reason loginFailure = null;   // 로그인 인증 코드 DM 실패
         volatile int lookups = 0;
+
+        FakeDiscord() {
+            users.put(ID_CHUL, "철수");                                 // 철수(SENDER)는 항상 로그인할 수 있다
+        }
+
+        /** 로그인(사용자 조회 1번 + 인증 코드 DM 1번)을 뺀, 편지 쪽에서 한 사용자 조회 수. */
+        int letterLookups() {
+            return lookups - loginDms.size();
+        }
 
         @Override
         public Optional<DiscordUser> findUser(DiscordId id) {
@@ -2052,6 +2070,11 @@ public class LetterTests {
 
         @Override
         public void sendDirectMessage(DiscordId to, String content) throws DiscordGatewayException {
+            if (content.startsWith("🔐")) {
+                if (loginFailure != null) throw new DiscordGatewayException(loginFailure, "가짜 실패");
+                loginDms.add(new String[]{to.value(), content});
+                return;
+            }
             if (dmFailure != null) throw new DiscordGatewayException(dmFailure, "가짜 실패");
             dms.add(new String[]{to.value(), content});
         }
@@ -2066,8 +2089,6 @@ public class LetterTests {
         volatile String channelBody = "{\"id\":\"" + CHANNEL_ID + "\",\"type\":1}";
         volatile int messageStatus = 200;
         volatile String messageBody = "{\"id\":\"1\"}";
-        volatile int tokenStatus = 200;
-        volatile String tokenBody = "{\"access_token\":\"AT123\",\"token_type\":\"Bearer\"}";
 
         FakeDiscordRest() throws IOException {
             server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -2081,13 +2102,7 @@ public class LetterTests {
 
                 int status;
                 String reply;
-                if (path.equals("/oauth2/token")) {
-                    status = tokenStatus;
-                    reply = tokenBody;
-                } else if (path.equals("/oauth2/token/revoke")) {
-                    status = 200;
-                    reply = "{}";
-                } else if (path.startsWith("/users/@me/channels")) {
+                if (path.startsWith("/users/@me/channels")) {
                     status = 200;
                     reply = channelBody;
                 } else if (path.startsWith("/users/")) {
@@ -2116,70 +2131,37 @@ public class LetterTests {
         }
     }
 
-    /** 디스코드 OAuth 대신 쓰는 가짜. 승인 코드({@link #approve})로 사용자를 알려 준다. */
-    private static class FakeOAuth implements DiscordOAuth {
-        final Map<String, DiscordUser> users = new ConcurrentHashMap<>();
-        volatile DiscordGatewayException.Reason failure = null;
-        volatile int identifies = 0;
-
-        FakeOAuth approve(String code, DiscordUser user) {
-            users.put(code, user);
-            return this;
-        }
-
-        @Override
-        public String authorizeUrl(String state) {
-            return "https://discord.test/oauth2/authorize?client_id=1&state=" + state;
-        }
-
-        @Override
-        public DiscordUser identify(String code) throws DiscordGatewayException {
-            identifies++;
-            if (failure != null) throw new DiscordGatewayException(failure, "가짜 실패");
-            DiscordUser user = users.get(code);
-            if (user == null) throw new DiscordGatewayException(Reason.INVALID_CODE, "알 수 없는 승인 코드");
-            return user;
-        }
-    }
-
     /**
-     * 진짜 HttpLetterApi인데, 로그인을 시작하면 사용자가 브라우저에서 하는 일(디스코드 승인 뒤 돌아오기, 확인 코드 입력)을
-     * 서버에 그대로 해 준다. 그래서 콘솔 앱의 로그인 대기가 곧바로 끝난다.
+     * 진짜 HttpLetterApi에, 로그인 정보(누구로 로그인할지)와 테스트용 도구를 더한 것.
+     * 테스트 서버는 인증 코드를 항상 {@link #LOGIN_CODE}로 만들므로, 콘솔 앱에 입력할 로그인 두 줄을 미리 알 수 있다.
      */
     private static class TestApi extends HttpLetterApi {
         final int port;
-        volatile String approvalCode;
+        final DiscordUser who;
         volatile String token;
         volatile LoginTicket lastTicket;
         final List<String> tokens = new CopyOnWriteArrayList<>();   // 지금까지 받은 세션 토큰
 
-        TestApi(int port, String approvalCode) {
+        TestApi(int port, DiscordUser who) {
             super("http://127.0.0.1:" + port);
             this.port = port;
-            this.approvalCode = approvalCode;
+            this.who = who;
         }
 
         @Override
-        public LoginTicket startLogin() throws ApiException {
+        public LoginTicket startLogin(DiscordId id) throws ApiException {
             token = null;
-            LoginTicket ticket = super.startLogin();
+            LoginTicket ticket = super.startLogin(id);
             lastTicket = ticket;
-            try {
-                approveInBrowser(port, ticket, approvalCode, ticket.confirmCode());
-            } catch (Exception e) {
-                throw new AssertionError(e);
-            }
             return ticket;
         }
 
         @Override
-        public LoginPoll pollLogin(LoginTicket ticket) throws ApiException {
-            LoginPoll poll = super.pollLogin(ticket);
-            if (poll.isDone()) {
-                token = poll.token();
-                tokens.add(token);
-            }
-            return poll;
+        public LoginResult verifyLogin(LoginTicket ticket, String code) throws ApiException {
+            LoginResult result = super.verifyLogin(ticket, code);
+            token = result.token();
+            tokens.add(token);
+            return result;
         }
 
         @Override
@@ -2189,33 +2171,34 @@ public class LetterTests {
         }
 
         /** 로그인을 끝까지 해서 이 객체를 로그인 상태로 만든다. */
-        LoginPoll login() throws ApiException {
-            return pollLogin(startLogin());
+        LoginResult login() throws ApiException {
+            return verifyLogin(startLogin(who.id()), LOGIN_CODE);
+        }
+
+        /** 콘솔 앱이 로그인할 때 입력받는 두 줄: 내 디스코드 ID, DM으로 받은 인증 코드. */
+        String loginInput() {
+            return who.id().value() + "\n" + LOGIN_CODE + "\n";
         }
     }
 
-    /** 브라우저가 하는 일: 디스코드에서 승인하고 돌아온 뒤(callback), 확인 코드를 입력한다(confirm). 확인 화면의 상태 코드를 돌려준다. */
-    private static int approveInBrowser(int port, LoginTicket ticket, String approvalCode, String confirmCode) throws Exception {
-        String state = Pattern.compile("state=([^&]+)").matcher(ticket.url()).results().findFirst().orElseThrow().group(1);
-        String base = "http://127.0.0.1:" + port + "/auth/";
-        int callback = anonymousHttp("GET", base + "callback?state=" + state + "&code=" + approvalCode, null).statusCode();
-        if (callback != 200) return callback;
-        return anonymousHttp("POST", base + "confirm", "state=" + state + "&code="
-                + java.net.URLEncoder.encode(confirmCode, StandardCharsets.UTF_8)).statusCode();
+    /** 테스트 서버를 만든다. 인증 코드는 항상 {@link #LOGIN_CODE}이다. generousLimits면 로그인 시작 횟수 제한을 사실상 없앤다. */
+    private static LetterServer testServer(ServerConfig config, DiscordGateway gateway, boolean generousLimits) {
+        RateLimiter limiter = generousLimits ? new RateLimiter(100_000, Duration.ofMinutes(10), Clock.systemUTC()) : null;
+        return new LetterServer(config, gateway, new FixedCodeRandom(), limiter);
     }
 
     private interface ServerCheck {
         void run(LetterServer server, TestApi api, Path dataDir) throws Exception;
     }
 
-    private interface OAuthServerCheck {
-        void run(LetterServer server, FakeOAuth oauth, Path dataDir) throws Exception;
+    private interface LoginServerCheck {
+        void run(LetterServer server, Path dataDir) throws Exception;
     }
 
     /** 진짜 LetterServer를 비어 있는 포트에 띄우고, 철수(SENDER)로 로그인한 api를 준다. gateway가 null이면 디스코드 기능이 꺼진 서버. */
     private static void withServer(DiscordGateway gateway, ServerCheck check) throws Exception {
-        withOAuthServer(gateway, (server, oauth, dir) -> {
-            TestApi api = new TestApi(server.port(), CODE_CHUL);
+        withLoginServer(gateway, (server, dir) -> {
+            TestApi api = new TestApi(server.port(), SENDER);
             api.login();
             sessionOwner = api;
             try {
@@ -2226,15 +2209,14 @@ public class LetterTests {
         });
     }
 
-    /** 위와 같지만 로그인은 하지 않은 채 가짜 OAuth를 넘겨 준다. (로그인 자체를 시험할 때) */
-    private static void withOAuthServer(DiscordGateway gateway, OAuthServerCheck check) throws Exception {
+    /** 위와 같지만 로그인은 하지 않은 채 서버만 준다. (로그인 자체를 시험할 때) gateway는 철수가 로그인할 수 있어야 한다. */
+    private static void withLoginServer(DiscordGateway gateway, LoginServerCheck check) throws Exception {
         withTempDir(dir -> {
-            FakeOAuth oauth = new FakeOAuth().approve(CODE_CHUL, SENDER);
             ServerConfig config = new ServerConfig(0, dir, 2_000_000, 1000, ZoneId.of("Asia/Seoul"), null);
-            LetterServer server = new LetterServer(config, gateway, oauth);
+            LetterServer server = testServer(config, gateway, true);
             server.start();
             try {
-                check.run(server, oauth, dir);
+                check.run(server, dir);
             } finally {
                 server.stop();
             }
@@ -2250,9 +2232,10 @@ public class LetterTests {
 
     /** runApp과 같지만 끝난 뒤 다시 로그인하지 않는다. (종료 시 로그아웃을 확인할 때) */
     private static String runAppOnly(LetterApi api, String script) {
+        String input = (api instanceof TestApi test ? test.loginInput() : "") + script;   // 로그인 입력을 앞에 붙인다
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         ConsoleView view = new ConsoleView(
-                new ByteArrayInputStream(script.getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8,
+                new ByteArrayInputStream(input.getBytes(StandardCharsets.UTF_8)), StandardCharsets.UTF_8,
                 new PrintStream(out, true, StandardCharsets.UTF_8));
         new LetterApp(api, view).run();
         return out.toString(StandardCharsets.UTF_8);
@@ -2328,6 +2311,18 @@ public class LetterTests {
         } catch (LetterException e) {
             eq(expected, e.kind());
             return;
+        } catch (Exception e) {
+            throw new AssertionError("다른 예외가 발생함: " + e);
+        }
+        throw new AssertionError("예외가 발생하지 않음");
+    }
+
+    /** 동작이 LetterException을 던지는지 확인하고 그 예외를 돌려준다. */
+    private static LetterException expect(Check action) {
+        try {
+            action.run();
+        } catch (LetterException e) {
+            return e;
         } catch (Exception e) {
             throw new AssertionError("다른 예외가 발생함: " + e);
         }
